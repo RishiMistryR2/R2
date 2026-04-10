@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "r2"
+version = "0.1.0"
+description = "R2 — real-time SPY trading analyst"
+requires-python = ">=3.11"
+dependencies = [
+    "alpaca-py>=0.28.0",
+    "anthropic>=0.49.0",
+    "aiohttp>=3.9.0",
+    "pytz>=2024.1",
+]
+
+[project.optional-dependencies]
+cli  = ["rich>=13.7.0"]
+dev  = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
+
+[tool.pytest.ini_options]
+asyncio_mode   = "auto"
+testpaths      = ["tests"]
+python_files   = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["engine*", "strategy*", "context*", "memory*", "trades*", "ai*", "cli*", "config*", "core*", "interface*"]
