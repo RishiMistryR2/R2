@@ -1,35 +1,44 @@
 """
-IndicatorEngine: reads candle history, computes all indicators,
-assesses trend direction/strength, detects S/R levels,
-and assembles a MarketState snapshot.
+engine/indicator_engine.py
 
-Called by the main engine loop whenever a candle closes.
+Reads candle history from CandleStore, computes all indicators,
+assesses trend direction/strength, detects S/R levels, applies
+readiness and premarket penalties, and assembles MarketState.
+
 All math is delegated to indicators.py (pure functions).
+Readiness is computed from CandleStore.get_readiness().
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from engine.candle_store import CandleStore
 from engine.models import (
-    Candle,
     Direction,
     IndicatorSnapshot,
     MarketState,
+    Readiness,
+    SessionState,
+    SessionPhase,
     SupportResistanceLevel,
     TrendState,
     TrendStrength,
 )
+from engine.readiness import (
+    compute_readiness,
+    readiness_regime_confidence_cap,
+    premarket_confidence_reduction,
+)
 from engine import indicators as ind
 from config.settings import (
     ATR_PERIOD,
-    EMA_PERIODS,
     MACD_FAST,
     MACD_SIGNAL,
     MACD_SLOW,
     MIN_CANDLES_FOR_INDICATORS,
+    PREMARKET_WINDOW_FRACTION,
     RSI_NEUTRAL_HIGH,
     RSI_NEUTRAL_LOW,
     RSI_OVERBOUGHT,
@@ -62,14 +71,29 @@ class IndicatorEngine:
     def compute(self) -> MarketState:
         """
         Build a complete MarketState from current candle history.
-        Called after each 1m close (or whenever you want a fresh snapshot).
+        Readiness is computed first and governs what gets populated.
         """
         now = datetime.now(tz=timezone.utc)
+
+        readiness, readiness_note = self.store.get_readiness()
+
         state = MarketState(symbol=SYMBOL, timestamp=now)
+
+        # Attach a minimal SessionState with the readiness level so downstream
+        # components (scorer, gates) have it without importing the store.
+        # session_state.py will overwrite this with full phase/time info.
+        state.session = SessionState(
+            phase=SessionPhase.MIDDAY,   # placeholder — replaced by strategy engine
+            readiness=readiness,
+        )
+
+        if readiness == Readiness.NOT_READY:
+            # Not enough history to compute anything meaningful
+            return state
 
         for tf in TIMEFRAMES:
             if self.store.candle_count(tf) < MIN_CANDLES_FOR_INDICATORS:
-                continue  # not enough history yet
+                continue
 
             snap  = self._compute_indicators(tf)
             trend = self._assess_trend(tf, snap)
@@ -77,13 +101,13 @@ class IndicatorEngine:
             state.indicators[tf] = snap
             state.trends[tf]     = trend
 
-        # S/R levels from 15m (good balance of noise vs significance)
+        # S/R from 15m (balance of noise vs significance)
         if self.store.candle_count("15m") >= MIN_CANDLES_FOR_INDICATORS:
             supports, resistances = self._find_sr_levels("15m")
             state.support_levels    = supports
             state.resistance_levels = resistances
 
-        # Higher-timeframe bias from 1h + daily
+        # HTF bias
         state.htf_bias = self._compute_htf_bias(state)
 
         return state
@@ -101,42 +125,42 @@ class IndicatorEngine:
         if not closes:
             return IndicatorSnapshot(timeframe=tf, timestamp=datetime.now(tz=timezone.utc))
 
+        now  = datetime.now(tz=timezone.utc)
         snap = IndicatorSnapshot(
             timeframe=tf,
-            timestamp=datetime.now(tz=timezone.utc),
+            timestamp=now,
             close=closes[-1],
         )
 
-        # EMAs
         snap.ema_9   = ind.ema(closes, 9)
         snap.ema_20  = ind.ema(closes, 20)
         snap.ema_50  = ind.ema(closes, 50)
         snap.ema_200 = ind.ema(closes, 200)
 
-        # VWAP (intraday only — meaningful on 1m/5m)
+        # VWAP: intraday accumulator for 1m/5m; computed over window for others
         if tf in ("1m", "5m"):
             snap.vwap = self.store.get_vwap()
         else:
             snap.vwap = ind.vwap(highs, lows, closes, volumes)
 
-        # RSI
         snap.rsi = ind.rsi(closes, RSI_PERIOD)
 
-        # MACD
         snap.macd_line, snap.macd_signal, snap.macd_hist = ind.macd(
             closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL
         )
 
-        # ATR
         snap.atr = ind.atr(highs, lows, closes, ATR_PERIOD)
 
-        # Derived labels
         snap.ema_stack     = ind.classify_ema_stack(
             snap.ema_9, snap.ema_20, snap.ema_50, snap.ema_200, snap.close
         )
         snap.rsi_zone      = self._classify_rsi(snap.rsi)
         snap.macd_bias     = self._classify_macd(snap.macd_line, snap.macd_signal, snap.macd_hist)
         snap.price_vs_vwap = self._classify_vwap(snap.close, snap.vwap)
+
+        # Premarket session mix flag
+        pre_frac = self.store.premarket_fraction(tf)
+        snap.session_mix = pre_frac > PREMARKET_WINDOW_FRACTION
 
         return snap
 
@@ -145,7 +169,7 @@ class IndicatorEngine:
     # ──────────────────────────────────────────
 
     def _assess_trend(self, tf: str, snap: IndicatorSnapshot) -> TrendState:
-        trend = TrendState(timeframe=tf)
+        trend  = TrendState(timeframe=tf)
         closes = self.store.get_closes(tf)
         highs  = self.store.get_highs(tf)
         lows   = self.store.get_lows(tf)
@@ -153,61 +177,42 @@ class IndicatorEngine:
         if len(closes) < SWING_LOOKBACK * 2 + 5:
             return trend
 
-        # ── Direction ──────────────────────────
-        bull_points = 0
-        bear_points = 0
+        # ── Direction scoring ─────────────────
+        bull = bear = 0
 
-        # EMA stack
         if snap.ema_stack == "bull_aligned":
-            bull_points += 3
+            bull += 3
         elif snap.ema_stack == "bear_aligned":
-            bear_points += 3
+            bear += 3
 
-        # Price vs key EMAs
         close = snap.close
-        if snap.ema_20 and close > snap.ema_20:
-            bull_points += 1
-        elif snap.ema_20 and close < snap.ema_20:
-            bear_points += 1
+        if snap.ema_20:
+            if close > snap.ema_20: bull += 1
+            else:                   bear += 1
+        if snap.ema_50:
+            if close > snap.ema_50: bull += 1
+            else:                   bear += 1
 
-        if snap.ema_50 and close > snap.ema_50:
-            bull_points += 1
-        elif snap.ema_50 and close < snap.ema_50:
-            bear_points += 1
+        if snap.macd_bias == "bullish":   bull += 1
+        elif snap.macd_bias == "bearish": bear += 1
 
-        # MACD
-        if snap.macd_bias == "bullish":
-            bull_points += 1
-        elif snap.macd_bias == "bearish":
-            bear_points += 1
+        if snap.price_vs_vwap == "above": bull += 1
+        elif snap.price_vs_vwap == "below": bear += 1
 
-        # Price vs VWAP
-        if snap.price_vs_vwap == "above":
-            bull_points += 1
-        elif snap.price_vs_vwap == "below":
-            bear_points += 1
+        if bull > bear + 1:     trend.direction = Direction.BULLISH
+        elif bear > bull + 1:   trend.direction = Direction.BEARISH
+        else:                   trend.direction = Direction.NEUTRAL
 
-        if bull_points > bear_points + 1:
-            trend.direction = Direction.BULLISH
-        elif bear_points > bull_points + 1:
-            trend.direction = Direction.BEARISH
-        else:
-            trend.direction = Direction.NEUTRAL
+        # ── Strength ──────────────────────────
+        delta = abs(bull - bear)
+        if delta >= 5:    trend.strength = TrendStrength.STRONG
+        elif delta >= 3:  trend.strength = TrendStrength.MODERATE
+        elif delta >= 1:  trend.strength = TrendStrength.WEAK
+        else:             trend.strength = TrendStrength.NONE
 
-        # ── Strength ───────────────────────────
-        delta = abs(bull_points - bear_points)
-        if delta >= 5:
-            trend.strength = TrendStrength.STRONG
-        elif delta >= 3:
-            trend.strength = TrendStrength.MODERATE
-        elif delta >= 1:
-            trend.strength = TrendStrength.WEAK
-        else:
-            trend.strength = TrendStrength.NONE
-
-        # ── Swing structure (HH/LL) ────────────
+        # ── Swing structure ───────────────────
         swing_highs = ind.find_swing_highs(highs, SWING_LOOKBACK)
-        swing_lows  = ind.find_swing_lows(lows, SWING_LOOKBACK)
+        swing_lows  = ind.find_swing_lows(lows,  SWING_LOOKBACK)
 
         if len(swing_highs) >= 2:
             trend.last_swing_high = swing_highs[-1][1]
@@ -216,65 +221,49 @@ class IndicatorEngine:
             trend.last_swing_low = swing_lows[-1][1]
             trend.lower_lows     = swing_lows[-1][1] < swing_lows[-2][1]
 
-        # ── Weakening detection ─────────────────
-        trend.is_weakening = self._detect_weakening(trend, snap, swing_highs, swing_lows)
+        # ── Weakening ─────────────────────────
+        trend.is_weakening = self._detect_weakening(trend, snap)
 
-        # ── Structure break ─────────────────────
-        trend.structure_break = self._detect_structure_break(
-            trend, snap, swing_highs, swing_lows, close
-        )
+        # ── Structure break ───────────────────
+        trend.structure_break = self._detect_structure_break(trend, snap, close)
 
         return trend
 
     def _detect_weakening(
         self,
-        trend:        TrendState,
-        snap:         IndicatorSnapshot,
-        swing_highs:  list,
-        swing_lows:   list,
+        trend: TrendState,
+        snap:  IndicatorSnapshot,
     ) -> bool:
-        """
-        Trend is weakening when:
-        - Bullish but RSI diverging (lower highs on RSI while price makes higher highs)
-        - MACD histogram shrinking while price continues
-        - Price makes new high but EMA stack is no longer fully aligned
-        """
+        """2 of 3 signals required."""
+        signals = 0
+
         if trend.direction == Direction.BULLISH:
-            # Price making new highs but RSI in overbought and diverging
-            if snap.rsi and snap.rsi > RSI_OVERBOUGHT:
-                if snap.macd_hist is not None and snap.macd_hist < 0:
-                    return True
-            # Price above EMAs but stack mixed
+            if snap.rsi and snap.rsi > RSI_OVERBOUGHT and snap.macd_hist and snap.macd_hist < 0:
+                signals += 1
+            if snap.macd_hist is not None and snap.macd_hist < 0:
+                signals += 1
             if snap.ema_stack == "mixed" and snap.close > (snap.ema_50 or 0):
-                return True
-
+                signals += 1
         elif trend.direction == Direction.BEARISH:
-            if snap.rsi and snap.rsi < RSI_OVERSOLD:
-                if snap.macd_hist is not None and snap.macd_hist > 0:
-                    return True
+            if snap.rsi and snap.rsi < RSI_OVERSOLD and snap.macd_hist and snap.macd_hist > 0:
+                signals += 1
+            if snap.macd_hist is not None and snap.macd_hist > 0:
+                signals += 1
             if snap.ema_stack == "mixed" and snap.close < (snap.ema_50 or float("inf")):
-                return True
+                signals += 1
 
-        return False
+        return signals >= 2
 
     def _detect_structure_break(
         self,
-        trend:       TrendState,
-        snap:        IndicatorSnapshot,
-        swing_highs: list,
-        swing_lows:  list,
-        close:       float,
+        trend: TrendState,
+        snap:  IndicatorSnapshot,
+        close: float,
     ) -> bool:
-        """
-        Bullish structure break: price closes below last significant swing low.
-        Bearish structure break: price closes above last significant swing high.
-        """
         if trend.direction == Direction.BULLISH and trend.last_swing_low:
             return close < trend.last_swing_low
-
         if trend.direction == Direction.BEARISH and trend.last_swing_high:
             return close > trend.last_swing_high
-
         return False
 
     # ──────────────────────────────────────────
@@ -284,11 +273,7 @@ class IndicatorEngine:
     def _find_sr_levels(
         self,
         tf: str,
-    ) -> tuple[List[SupportResistanceLevel], List[SupportResistanceLevel]]:
-        """
-        Identify S/R from swing highs/lows on the given timeframe.
-        Clusters levels that are within ATR/2 of each other (same zone).
-        """
+    ) -> Tuple[List[SupportResistanceLevel], List[SupportResistanceLevel]]:
         highs  = self.store.get_highs(tf)
         lows   = self.store.get_lows(tf)
         closes = self.store.get_closes(tf)
@@ -300,31 +285,21 @@ class IndicatorEngine:
         zone    = atr_val * SR_ZONE_ATR_MULT
 
         swing_highs = ind.find_swing_highs(highs, SWING_LOOKBACK)
-        swing_lows  = ind.find_swing_lows(lows, SWING_LOOKBACK)
+        swing_lows  = ind.find_swing_lows(lows,  SWING_LOOKBACK)
 
-        resistances = self._cluster_levels(
-            [p for _, p in swing_highs], zone, "resistance"
-        )
-        supports = self._cluster_levels(
-            [p for _, p in swing_lows], zone, "support"
-        )
+        resistances = self._cluster_levels([p for _, p in swing_highs], zone, "resistance")
+        supports    = self._cluster_levels([p for _, p in swing_lows],  zone, "support")
 
-        # Filter by minimum touches and sort by proximity to current price
-        current_price = closes[-1]
-        resistances = [
-            r for r in resistances if r.touches >= SR_MIN_TOUCHES
-        ]
-        supports = [
-            s for s in supports if s.touches >= SR_MIN_TOUCHES
-        ]
+        current = closes[-1]
 
-        # Sort: resistances ascending (nearest first), supports descending (nearest first)
-        resistances.sort(key=lambda r: r.price)
-        supports.sort(key=lambda s: -s.price)
-
-        # Only return levels near current price
-        resistances = [r for r in resistances if r.price > current_price][:5]
-        supports    = [s for s in supports    if s.price < current_price][:5]
+        resistances = sorted(
+            [r for r in resistances if r.touches >= SR_MIN_TOUCHES and r.price > current],
+            key=lambda r: r.price,
+        )[:5]
+        supports = sorted(
+            [s for s in supports if s.touches >= SR_MIN_TOUCHES and s.price < current],
+            key=lambda s: -s.price,
+        )[:5]
 
         return supports, resistances
 
@@ -334,16 +309,13 @@ class IndicatorEngine:
         zone:       float,
         level_type: str,
     ) -> List[SupportResistanceLevel]:
-        """Merge prices within `zone` distance into a single level."""
         if not prices:
             return []
-
         clusters: List[SupportResistanceLevel] = []
         for price in sorted(prices):
             merged = False
             for cluster in clusters:
                 if abs(cluster.price - price) <= zone:
-                    # Update cluster to weighted average
                     cluster.price   = (cluster.price * cluster.touches + price) / (cluster.touches + 1)
                     cluster.touches += 1
                     merged = True
@@ -352,44 +324,28 @@ class IndicatorEngine:
                 clusters.append(SupportResistanceLevel(
                     price=price, level_type=level_type, touches=1
                 ))
-
-        # Assign strength
         for c in clusters:
-            if c.touches >= 4:
-                c.strength = "strong"
-            elif c.touches >= 2:
-                c.strength = "moderate"
-            else:
-                c.strength = "weak"
-
+            if c.touches >= 4:   c.strength = "strong"
+            elif c.touches >= 2: c.strength = "moderate"
+            else:                c.strength = "weak"
         return clusters
 
     # ──────────────────────────────────────────
-    # Higher-timeframe bias
+    # HTF bias
     # ──────────────────────────────────────────
 
     def _compute_htf_bias(self, state: MarketState) -> Direction:
-        """
-        Combine 1h and daily trend to get overall directional bias.
-        Used to align trade direction on lower timeframes.
-        """
-        bias_points = 0
-
+        bias = 0
         for tf in ("1h", "1d"):
             trend = state.trends.get(tf)
             if trend is None:
                 continue
-            if trend.direction == Direction.BULLISH:
-                weight = 2 if trend.strength == TrendStrength.STRONG else 1
-                bias_points += weight
-            elif trend.direction == Direction.BEARISH:
-                weight = 2 if trend.strength == TrendStrength.STRONG else 1
-                bias_points -= weight
+            w = 2 if trend.strength == TrendStrength.STRONG else 1
+            if trend.direction == Direction.BULLISH:   bias += w
+            elif trend.direction == Direction.BEARISH: bias -= w
 
-        if bias_points >= 2:
-            return Direction.BULLISH
-        if bias_points <= -2:
-            return Direction.BEARISH
+        if bias >= 2:   return Direction.BULLISH
+        if bias <= -2:  return Direction.BEARISH
         return Direction.NEUTRAL
 
     # ──────────────────────────────────────────
@@ -400,30 +356,23 @@ class IndicatorEngine:
     def _classify_rsi(rsi_val: Optional[float]) -> Optional[str]:
         if rsi_val is None:
             return None
-        if rsi_val >= RSI_OVERBOUGHT:
-            return "overbought"
-        if rsi_val <= RSI_OVERSOLD:
-            return "oversold"
-        if rsi_val >= RSI_NEUTRAL_HIGH:
-            return "bullish_neutral"
-        if rsi_val <= RSI_NEUTRAL_LOW:
-            return "bearish_neutral"
+        if rsi_val >= RSI_OVERBOUGHT:  return "overbought"
+        if rsi_val <= RSI_OVERSOLD:    return "oversold"
+        if rsi_val >= RSI_NEUTRAL_HIGH: return "bullish_neutral"
+        if rsi_val <= RSI_NEUTRAL_LOW:  return "bearish_neutral"
         return "neutral"
 
     @staticmethod
     def _classify_macd(
-        line: Optional[float],
+        line:   Optional[float],
         signal: Optional[float],
-        hist: Optional[float],
+        hist:   Optional[float],
     ) -> Optional[str]:
         if line is None or signal is None or hist is None:
             return None
-        if line > signal and hist > 0:
-            return "bullish"
-        if line < signal and hist < 0:
-            return "bearish"
-        if hist > 0:
-            return "bullish_crossing"
+        if line > signal and hist > 0:   return "bullish"
+        if line < signal and hist < 0:   return "bearish"
+        if hist > 0:                     return "bullish_crossing"
         return "bearish_crossing"
 
     @staticmethod
