@@ -87,9 +87,17 @@ class StrategyEngine:
             return state
 
         # ── Step 0: Session + Regime ─────────────────────
-        # Respect pre-injected values (tests or user override)
-        if state.session is None:
+        # Preserve readiness from indicator engine before overwriting session
+        existing_readiness = (
+            state.session.readiness if state.session else None
+        )
+        # Respect pre-injected session (tests or user override); otherwise compute
+        if state.session is None or not state.session.market_open:
             state.session = compute_session_state()
+        # Carry readiness from indicator engine into the new session state
+        if existing_readiness is not None:
+            state.session.readiness = existing_readiness
+
         if state.regime is None:
             state.regime = self._regime_engine.classify(state)
 

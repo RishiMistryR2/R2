@@ -22,6 +22,7 @@ from engine.models import (
     ExitReason,
     IndicatorSnapshot,
     MarketState,
+    Readiness,
     TradeDirection,
     TradeState,
     TrendState,
@@ -71,6 +72,8 @@ def check_long_entry(state: MarketState) -> EntrySignal:
     gates_passed = 0
 
     # ── Gate 0: Regime + Session + Intent pre-checks ─────
+    if state.session and state.session.readiness == Readiness.NOT_READY:
+        return EntrySignal(False, None, "Readiness gate: system not ready — still seeding", gates_passed)
     if hasattr(state, "regime") and state.regime and not state.regime.entry_permitted:
         return EntrySignal(False, None,
             f"Regime gate: {state.regime.regime.value} — entries not permitted ({state.regime.caution_note})",
@@ -154,6 +157,8 @@ def check_short_entry(state: MarketState) -> EntrySignal:
     gates_passed = 0
 
     # ── Gate 0: Regime + Session + Intent pre-checks ─────
+    if state.session and state.session.readiness == Readiness.NOT_READY:
+        return EntrySignal(False, None, "Readiness gate: system not ready — still seeding", gates_passed)
     if hasattr(state, "regime") and state.regime and not state.regime.entry_permitted:
         return EntrySignal(False, None,
             f"Regime gate: {state.regime.regime.value} — entries not permitted",

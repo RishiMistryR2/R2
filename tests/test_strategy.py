@@ -11,7 +11,7 @@ from engine.models import (
     Direction, IndicatorSnapshot, MarketState, MarketNarrative,
     NarrativeState, SetupType, TradeDirection, TradeState, TradeStatus,
     TrendState, TrendStrength, ExitReason,
-    RegimeState, MarketRegime, SessionState, SessionPhase, SessionIntent,
+    RegimeState, MarketRegime, SessionState, SessionPhase, SessionIntent, Readiness,
 )
 from strategy.timeframes import (
     compute_tf_consensus, get_htf_bias, is_entry_allowed,
@@ -67,6 +67,7 @@ def _bull_state(score_threshold=False):
         score_modifier=1.0,
         entry_filter="normal",
         phase_note="normal operations",
+        readiness=Readiness.FULLY_READY,
     )
     s.regime = RegimeState(
         regime=MarketRegime.TREND_BULL,
@@ -96,6 +97,7 @@ def _bear_state():
         score_modifier=1.0,
         entry_filter="normal",
         phase_note="normal operations",
+        readiness=Readiness.FULLY_READY,
     )
     s.regime = RegimeState(
         regime=MarketRegime.TREND_BEAR,

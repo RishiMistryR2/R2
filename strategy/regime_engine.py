@@ -283,8 +283,8 @@ class MarketRegimeEngine:
     # RegimeState builder
     # ──────────────────────────────────────────
 
-    @staticmethod
     def _build_regime_state(
+        self,
         regime:             MarketRegime,
         state:              MarketState,
         candles_in_regime:  int,
@@ -305,6 +305,7 @@ class MarketRegimeEngine:
             MarketRegime.RANGE:            "Do not chase — only trade at the edges.",
         }
         confidence = _regime_confidence(state)
+        prev = self._current.regime if self._current else None
         return RegimeState(
             regime=regime,
             confidence=confidence,
@@ -314,6 +315,8 @@ class MarketRegimeEngine:
             preferred_setups=REGIME_PREFERRED_SETUPS.get(regime, []),
             caution_note=cautions.get(regime, ""),
             candles_in_regime=candles_in_regime,
+            raw_scores=_compute_raw_scores(state),
+            prev_regime=prev,
         )
 
 
@@ -323,3 +326,82 @@ def _regime_confidence(state: MarketState) -> float:
     consensus = compute_tf_consensus(state.trends)
     base = abs(consensus.weighted_score)
     return round(min(0.95, 0.4 + base * 0.9), 2)
+
+
+def _compute_raw_scores(state: MarketState) -> dict:
+    """
+    Score each regime using the signal table from the design spec.
+    Returns {regime_value: int_score} for transparency in AI context.
+    """
+    trend_1h  = state.trends.get("1h")
+    trend_15m = state.trends.get("15m")
+    ind_1h    = state.indicators.get("1h")
+
+    scores = {r.value: 0 for r in MarketRegime}
+
+    if not trend_1h or not trend_15m:
+        return scores
+
+    # S1: higher_highs on 1h
+    if trend_1h.higher_highs:
+        scores["trend_bull"] += 3
+        scores["trend_bear"] -= 1
+    # S2: lower_lows on 1h
+    if trend_1h.lower_lows:
+        scores["trend_bear"] += 3
+        scores["trend_bull"] -= 1
+    # Neither S1 nor S2
+    if not trend_1h.higher_highs and not trend_1h.lower_lows:
+        scores["range"] += 2
+        scores["chop"]  += 1
+
+    # S3: 1h bullish + strong/moderate
+    if (trend_1h.direction == Direction.BULLISH
+            and trend_1h.strength in (TrendStrength.STRONG, TrendStrength.MODERATE)):
+        scores["trend_bull"] += 2
+    # S4: 1h bearish + strong/moderate
+    if (trend_1h.direction == Direction.BEARISH
+            and trend_1h.strength in (TrendStrength.STRONG, TrendStrength.MODERATE)):
+        scores["trend_bear"] += 2
+    # S5: neutral
+    if trend_1h.direction == Direction.NEUTRAL:
+        scores["range"] += 2
+        scores["chop"]  += 2
+    # S6: weak/none strength
+    if trend_1h.strength in (TrendStrength.NONE, TrendStrength.WEAK):
+        scores["range"] += 1
+        scores["chop"]  += 2
+
+    # EMA stack signals
+    if ind_1h:
+        if ind_1h.ema_stack == "bull_aligned":
+            scores["trend_bull"] += 2
+        elif ind_1h.ema_stack == "bear_aligned":
+            scores["trend_bear"] += 2
+        elif ind_1h.ema_stack == "mixed":
+            scores["range"] += 1
+            scores["chop"]  += 2
+
+        # MACD histogram
+        if ind_1h.macd_hist is not None:
+            if ind_1h.macd_hist > 0.001:
+                scores["trend_bull"] += 1
+            elif ind_1h.macd_hist < -0.001:
+                scores["trend_bear"] += 1
+            else:
+                scores["range"] += 1
+                scores["chop"]  += 1
+
+        # ATR compression (low volatility favors range/chop)
+        if ind_1h.atr and ind_1h.close and ind_1h.close > 0:
+            atr_pct = ind_1h.atr / ind_1h.close
+            if atr_pct < 0.002:
+                scores["range"] += 1
+                scores["chop"]  += 1
+
+    # Defined S/R levels favor RANGE
+    if len(state.support_levels) >= 2 and len(state.resistance_levels) >= 2:
+        scores["range"] += 1
+
+    # Clamp all to 0 minimum
+    return {k: max(0, v) for k, v in scores.items()}

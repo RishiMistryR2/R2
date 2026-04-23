@@ -19,11 +19,14 @@ from engine.models import (
     Direction,
     IndicatorSnapshot,
     MarketState,
+    Readiness,
     SetupScore,
     TradeDirection,
     TrendState,
     TrendStrength,
 )
+from engine.readiness import readiness_score_penalty
+from config.settings import PARTIALLY_READY_PENALTY
 from strategy.timeframes import get_position_size_modifier
 
 
@@ -54,8 +57,12 @@ def score_setup(
     # Apply session modifier (if session is set on state)
     if hasattr(state, "session") and state.session:
         score.session_multiplier = state.session.score_modifier
+    # Apply readiness penalty
+    if state.session and state.session.readiness == Readiness.PARTIALLY_READY:
+        score.readiness_penalty = PARTIALLY_READY_PENALTY
     score.adjusted_total = round(
-        score.total * score.regime_multiplier * score.session_multiplier, 1
+        score.total * score.regime_multiplier * score.session_multiplier
+        - score.readiness_penalty, 1
     )
     return score
 
