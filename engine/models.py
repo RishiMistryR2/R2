@@ -78,11 +78,22 @@ class InstrumentType(Enum):
     SHARES  = "shares"
 
 
+
 class TradeStatus(Enum):
     OPEN    = "open"
     PARTIAL = "partial"
     CLOSED  = "closed"
     STOPPED = "stopped"
+
+
+# Inserted TradeLifecycle enum
+class TradeLifecycle(Enum):
+    CANDIDATE    = "candidate"
+    PLANNED      = "planned"
+    ACTIVE       = "active"
+    PARTIAL_EXIT = "partial_exit"
+    CLOSED       = "closed"
+    INVALIDATED  = "invalidated"
 
 
 class ExitReason(Enum):
@@ -551,6 +562,7 @@ class TradeState:
     entry_time:     datetime
     size:           float
     instrument_type: InstrumentType = InstrumentType.OPTIONS
+    lifecycle: Optional[Any] = None
 
     # Underlying levels
     entry_price:                   float = 0.0
