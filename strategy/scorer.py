@@ -60,9 +60,19 @@ def score_setup(
     # Apply readiness penalty
     if state.session and state.session.readiness == Readiness.PARTIALLY_READY:
         score.readiness_penalty = PARTIALLY_READY_PENALTY
+
+    # Apply context alignment adjustment (±5 points)
+    if hasattr(state, "context") and state.context is not None:
+        from context.event_confirmation import score_adjustment_from_context
+        score.context_adjustment = score_adjustment_from_context(
+            direction, state.context
+        )
+
     score.adjusted_total = round(
         score.total * score.regime_multiplier * score.session_multiplier
-        - score.readiness_penalty, 1
+        - score.readiness_penalty
+        + score.context_adjustment,
+        1,
     )
     return score
 

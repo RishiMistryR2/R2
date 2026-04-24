@@ -219,6 +219,11 @@ class ContextState:
     elevated_risk:   bool  = False        # True when major event within 2h or VIX extreme
     risk_note:       str   = ""           # e.g. "CPI release in 45 minutes"
 
+    # Phase 4 — aggregate context output (set by build_context / ContextEngine)
+    news_sentiment:       float = 0.0     # aggregate: –1.0 (bearish) … +1.0 (bullish)
+    context_bias:         str   = "neutral"        # "bullish" | "bearish" | "neutral"
+    volatility_risk_level: str  = "normal"         # "low" | "normal" | "elevated" | "extreme"
+
     # Data freshness
     news_stale:      bool  = False        # True if news > 30 min old
     context_valid:   bool  = True         # False if fetch failed
@@ -230,6 +235,9 @@ class ContextState:
             "vix":           {"level": self.vix_level, "regime": self.vix_regime},
             "elevated_risk": self.elevated_risk,
             "risk_note":     self.risk_note,
+            "news_sentiment":        self.news_sentiment,
+            "context_bias":          self.context_bias,
+            "volatility_risk_level": self.volatility_risk_level,
             "fed":           self.fed.to_dict() if self.fed else None,
             "top_headlines": [h.to_dict() for h in self.top_headlines[:5]],
             "trade_headlines": [h.to_dict() for h in self.trade_relevant_headlines[:3]],

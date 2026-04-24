@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -328,6 +328,7 @@ class SetupScore:
     session_multiplier: float = 1.0
     adjusted_total:     float = 0.0
     readiness_penalty:  float = 0.0
+    context_adjustment: float = 0.0
     sizing_flags:       List[str] = field(default_factory=list)
 
     def grade(self) -> str:
@@ -345,6 +346,7 @@ class SetupScore:
             "regime_mult":     self.regime_multiplier,
             "session_mult":    self.session_multiplier,
             "readiness_penalty": self.readiness_penalty,
+            "context_adjustment": self.context_adjustment,
             "components": {
                 "trend_alignment":   round(self.trend_alignment, 1),
                 "momentum_quality":  round(self.momentum_quality, 1),
@@ -767,6 +769,9 @@ class MarketState:
     internals:   Optional[MarketInternalsState]     = None
     active_trade: Optional[TradeState]  = None
     behavioral_flags: List[BehavioralFlag] = field(default_factory=list)
+    context: Optional[Any] = None
+    context_bias: str = "neutral"
+    context_risk_level: str = "normal"
 
     def to_dict(self) -> dict:
         return {

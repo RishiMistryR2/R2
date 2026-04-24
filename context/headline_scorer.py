@@ -18,7 +18,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple
 
-from context.models import NewsItem, SourceTier
+from context.models import NewsItem, SourceTier, Sentiment
 
 
 # ──────────────────────────────────────────────
@@ -191,8 +191,65 @@ class HeadlineScorer:
         """Classify a news source into a reliability tier."""
         lower = source_name.lower()
         if any(s in lower for s in TIER1_SOURCES):
-            return SourceTier.TIER1_AUTHORITATIVE
+            return SourceTier.TIER_1_AUTHORITATIVE
         if any(s in lower for s in TIER2_SOURCES):
-            return SourceTier.TIER2_CURATED
+            return SourceTier.TIER_2_CURATED
         # Default unknown sources to tier2 (don't exclude, but don't elevate)
-        return SourceTier.TIER2_CURATED
+        return SourceTier.TIER_2_CURATED
+
+
+# ──────────────────────────────────────────────
+# Standalone pure functions (Phase 4 spec)
+# ──────────────────────────────────────────────
+
+def score_headline(text: str) -> float:
+    """
+    Score a headline string using the keyword table.
+    Returns a sentiment float in [-1.0, +1.0].
+    Positive → bullish, negative → bearish, ~0 → neutral.
+
+    Pure function: (str) -> float. No side effects.
+    """
+    import re as _re
+    text_lower = text.lower()
+    sentiment  = 0.0
+    matches    = 0
+    for pattern, _imp, _rel, sent in KEYWORD_RULES:
+        if _re.search(pattern, text_lower, _re.IGNORECASE):
+            sentiment += sent
+            matches   += 1
+    if matches == 0:
+        return 0.0
+    return round(max(-1.0, min(1.0, sentiment / matches)), 3)
+
+
+def classify_sentiment(score: float) -> Sentiment:
+    """
+    Map a continuous sentiment score to the Sentiment enum.
+
+    Thresholds:
+      score >  0.15  → BULLISH
+      score < -0.15  → BEARISH
+      otherwise      → NEUTRAL
+    """
+    if score > 0.15:
+        return Sentiment.BULLISH
+    if score < -0.15:
+        return Sentiment.BEARISH
+    return Sentiment.NEUTRAL
+
+
+def compute_vix_regime(vix: float) -> str:
+    """
+    Classify a VIX level into a named volatility regime.
+    Used by ContextEngine to label the current environment.
+
+    Returns: "low" | "normal" | "elevated" | "extreme"
+    """
+    if vix < 13:
+        return "low"
+    if vix < 20:
+        return "normal"
+    if vix < 30:
+        return "elevated"
+    return "extreme"

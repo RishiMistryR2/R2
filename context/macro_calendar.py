@@ -144,3 +144,38 @@ class MacroCalendar:
                     fed.current_rate = event.actual
                     break
         return fed
+
+
+# ──────────────────────────────────────────────
+# Standalone stub (synchronous, no external deps)
+# ──────────────────────────────────────────────
+
+# Module-level injectable for testing
+_injected_events: list = []
+
+
+def inject_macro_events(events: list) -> None:
+    """Override events returned by get_macro_events(). Pass [] to clear."""
+    global _injected_events
+    _injected_events = events
+
+
+def get_macro_events(
+    injected: list = None,
+) -> list:
+    """
+    Return upcoming MacroEvent objects.
+
+    Priority:
+      1. `injected` argument  (per-call override)
+      2. `_injected_events`   (module-level override)
+      3. empty list           (safe default — no events scheduled)
+
+    In production this will call _fetch_upcoming_events() asynchronously.
+    For Phase 4 the synchronous stub is sufficient for all logic and tests.
+    """
+    if injected is not None:
+        return list(injected)
+    if _injected_events:
+        return list(_injected_events)
+    return []

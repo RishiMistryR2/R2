@@ -111,6 +111,9 @@ class StrategyEngine:
         state.narrative = classify_narrative(state)
         self._check_narrative_change(state.narrative)
 
+        # ── Step 4b: Context evaluation ──────────────────
+        self._evaluate_context(state)
+
         # ── Step 4: Trend flip detection ─────────────────
         self._detect_flips(state)
 
@@ -167,6 +170,23 @@ class StrategyEngine:
                     payload={"timeframe": tf, "reason": reason},
                     priority=1,
                 ))
+
+    def _evaluate_context(self, state: MarketState) -> None:
+        """
+        Step 4b — attach external context to the MarketState.
+
+        Context evaluation is non-fatal. If context fails, the strategy
+        pipeline continues without blocking trade logic.
+        """
+        try:
+            from context.context_engine import build_context
+
+            ctx = build_context(symbol=state.symbol)
+            state.context = ctx
+            state.context_bias = ctx.context_bias
+            state.context_risk_level = ctx.volatility_risk_level
+        except Exception as e:
+            logger.debug(f"Context evaluation skipped: {e}")
 
     def _detect_flips(self, state: MarketState) -> None:
         """Detect trend flips on key timeframes vs previous state."""
