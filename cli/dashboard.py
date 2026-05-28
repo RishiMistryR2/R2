@@ -93,7 +93,8 @@ def _render_header(state, now: datetime) -> str:
     phase  = ""
     if state.session:
         phase = f"  [{state.session.phase.value.upper()}]"
-    return f"  R2  ·  {symbol}{phase}  ·  {ts}"
+    source = getattr(state, "data_source", "MOCK")
+    return f"  R2  ·  {symbol}  [DATA:{source}]{phase}  ·  {ts}"
 
 
 def _render_market_status(state, context_state) -> str:

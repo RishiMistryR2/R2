@@ -99,6 +99,7 @@ class RuntimeState:
     # Identity
     symbol:       str           = "SPY"
     session_mode: SessionMode   = SessionMode.DEMO
+    data_source:  str           = "MOCK"
     status:       RuntimeStatus = RuntimeStatus.STARTING
 
     # Market state (refreshed each update cycle)

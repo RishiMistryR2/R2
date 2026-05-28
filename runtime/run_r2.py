@@ -12,14 +12,15 @@ Startup sequence:
   1. Configure logging
   2. Load .env (non-fatal)
   3. Initialise RuntimeState
-  4. Load memory — non-fatal: SessionMemory, PatternMemory, StartupBriefing
-  5. Seed initial market state — non-fatal: first update cycle
-  6. Build Scheduler
-  7. Show startup briefing — non-fatal
-  8. Set status RUNNING and return
+  4. Validate Alpaca credentials (_validate_alpaca) — sets data_source + session_mode
+  5. Load memory — non-fatal: SessionMemory, PatternMemory, StartupBriefing
+  6. Seed initial market state — non-fatal: first update cycle
+  7. Build Scheduler
+  8. Show startup briefing — non-fatal
+  9. Set status RUNNING and return
 
 Safety guarantee:
-  Every step after state initialisation is wrapped in try/except.
+  Every step after state construction is wrapped in try/except.
   startup() never raises — it always returns a usable (state, scheduler) pair.
 """
 
@@ -82,10 +83,8 @@ def startup(config: StartupConfig) -> tuple:
     Execute the full startup sequence.
 
     Returns (RuntimeState, Scheduler) ready for the runtime loop.
-
-    Every step after state construction is independently non-fatal:
-    a failure in memory loading or the first update cycle is logged
-    and skipped — R2 continues in a degraded-but-running state.
+    Every step after state construction is non-fatal so R2 always
+    reaches RUNNING state even when APIs are unavailable.
     """
     _configure_logging(config.log_level)
 
@@ -99,7 +98,7 @@ def startup(config: StartupConfig) -> tuple:
 
     _load_dotenv()
 
-    # Initialise state (the one step that is allowed to propagate failures)
+    # Initialise state
     state = RuntimeState(
         symbol                      = config.symbol,
         session_mode                = SessionMode.LIVE if config.live else SessionMode.DEMO,
@@ -109,19 +108,25 @@ def startup(config: StartupConfig) -> tuple:
     )
     logger.info(f"[startup] RuntimeState created  mode={state.session_mode.value}")
 
-    # All remaining steps are non-fatal
+    # Validate Alpaca credentials — sets session_mode and data_source
+    _validate_alpaca(state, config)
+
+    # Load memory (non-fatal)
     try:
         _load_memory(state)
     except Exception as e:
         logger.warning(f"[startup] _load_memory failed (non-fatal): {e}")
 
+    # Seed market state (non-fatal)
     try:
         _seed_market_state(state)
     except Exception as e:
         logger.warning(f"[startup] _seed_market_state failed (non-fatal): {e}")
 
+    # Build scheduler
     scheduler = _build_scheduler(config)
 
+    # Show startup briefing (non-fatal)
     if config.show_dashboard:
         try:
             _show_startup_briefing(state, config)
@@ -137,6 +142,60 @@ def startup(config: StartupConfig) -> tuple:
 # ──────────────────────────────────────────────
 # Startup helpers
 # ──────────────────────────────────────────────
+
+def _validate_alpaca(state: RuntimeState, config: StartupConfig) -> None:
+    """
+    Validate Alpaca credentials and set state.session_mode + state.data_source.
+
+    Outcomes:
+      config.live=False                           -> DEMO, data_source=MOCK
+      config.live=True, no keys                   -> DEMO, data_source=MOCK, WARNING
+      config.live=True, keys present, conn fails  -> DEMO, data_source=MOCK, WARNING
+      config.live=True, keys present, conn OK     -> LIVE, data_source=LIVE
+
+    Never raises.
+    """
+    if not config.live:
+        state.data_source = "MOCK"
+        logger.info(
+            "[startup] Demo mode — synthetic market data (MOCK).  "
+            "Use --live with Alpaca keys for real prices."
+        )
+        return
+
+    # Live requested — check keys
+    from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        logger.warning(
+            "[startup] --live requested but ALPACA_API_KEY / ALPACA_SECRET_KEY "
+            "not set in environment.  Falling back to MOCK mode.\n"
+            "         Add keys to .env or set environment variables."
+        )
+        state.session_mode = SessionMode.DEMO
+        state.data_source  = "MOCK"
+        return
+
+    # Keys present — test the connection
+    try:
+        from engine.alpaca_feed import validate_credentials
+        if validate_credentials():
+            state.session_mode = SessionMode.LIVE
+            state.data_source  = "LIVE"
+            logger.info("[startup] Alpaca credentials validated  [DATA:LIVE]")
+        else:
+            logger.warning(
+                "[startup] Alpaca connection test failed (bad keys or network).  "
+                "Falling back to MOCK mode."
+            )
+            state.session_mode = SessionMode.DEMO
+            state.data_source  = "MOCK"
+    except Exception as e:
+        logger.warning(
+            f"[startup] Alpaca validation error: {e}  Falling back to MOCK mode."
+        )
+        state.session_mode = SessionMode.DEMO
+        state.data_source  = "MOCK"
+
 
 def _load_dotenv() -> None:
     try:
@@ -177,10 +236,8 @@ def _configure_logging(level: str = "INFO") -> None:
 def _load_memory(state: RuntimeState) -> None:
     """
     Load all memory modules.
-    Each sub-step is independently non-fatal — a failure in one
-    does not prevent the others from running.
+    Each sub-step is independently non-fatal.
     """
-    # Session memory
     try:
         from memory.session_memory import SessionMemory
         state.session_memory = SessionMemory.today(state.symbol)
@@ -191,7 +248,6 @@ def _load_memory(state: RuntimeState) -> None:
     except Exception as e:
         logger.warning(f"[startup] session_memory load failed (non-fatal): {e}")
 
-    # Pattern memory
     try:
         from memory.pattern_memory import PatternMemory
         state.pattern_memory = PatternMemory()
@@ -201,7 +257,6 @@ def _load_memory(state: RuntimeState) -> None:
     except Exception as e:
         logger.warning(f"[startup] pattern_memory load failed (non-fatal): {e}")
 
-    # Startup briefing
     try:
         from memory.startup_context import build_startup_briefing
         state.startup_briefing = build_startup_briefing()

@@ -41,6 +41,7 @@ ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL",   "https://paper-api.alpaca.mar
 ALPACA_DATA_URL   = "https://data.alpaca.markets"
 ALPACA_WS_URL     = "wss://stream.data.alpaca.markets/v2/iex"
 ALPACA_NEWS_WS_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
+DATA_FEED_TIMEOUT = 10  # seconds for sync REST calls to Alpaca
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")

@@ -13,9 +13,11 @@ Safety:
   Every step is exception-safe.  Errors are caught, logged, and recorded
   in LoopHealth.  The runtime loop always continues.
 
-Demo mode:
-  When session_mode == DEMO, build_demo_state() constructs a plausible
-  MarketState without any live data feed.
+Data source labeling:
+  - LIVE session_mode attempts Alpaca REST; on failure falls back to MOCK.
+  - DEMO session_mode always produces MOCK.
+  - Both MarketState.data_source and RuntimeState.data_source are always
+    stamped explicitly so the dashboard and operator never see silent fakes.
 """
 
 from __future__ import annotations
@@ -27,6 +29,13 @@ from typing import Optional
 from runtime.runtime_state import RuntimeState, SessionMode
 
 logger = logging.getLogger("runtime.update")
+
+# Module-level import so mock.patch("runtime.update_cycle.build_live_state") works.
+# Guarded because alpaca_feed depends on optional packages (aiohttp, websockets).
+try:
+    from engine.alpaca_feed import build_live_state
+except Exception:
+    build_live_state = None  # type: ignore[assignment]
 
 
 # ──────────────────────────────────────────────
@@ -73,6 +82,7 @@ def run_update_cycle(state: RuntimeState) -> bool:
             f"  regime={_regime_label(market)}"
             f"  score={_score_label(state.setup_score)}"
             f"  warnings={len(warnings)}"
+            f"  source={state.data_source}"
         )
         return True
 
@@ -88,11 +98,40 @@ def run_update_cycle(state: RuntimeState) -> bool:
 # ──────────────────────────────────────────────
 
 def _get_market_state(state: RuntimeState):
-    """Return a fresh MarketState — demo or live."""
+    """
+    Return a fresh MarketState — live (Alpaca REST) or synthetic (demo).
+
+    LIVE session_mode:
+      - Attempt to fetch real bars from Alpaca via build_live_state.
+      - On success  -> MarketState + RuntimeState tagged data_source="LIVE"
+      - On failure  -> falls back to demo, tags data_source="MOCK",
+                       logs a WARNING so the operator always knows.
+    DEMO session_mode:
+      - Always returns demo state tagged data_source="MOCK".
+    """
     if state.session_mode == SessionMode.LIVE:
-        # Live mode wired in a future phase; fall through to demo for now
-        pass
-    return build_demo_state(state.symbol)
+        # Use the module-level name so mock.patch can intercept it in tests
+        live_fn = build_live_state
+        if live_fn is not None:
+            try:
+                market = live_fn(state.symbol)
+                market.data_source = "LIVE"
+                state.data_source  = "LIVE"
+                return market
+            except Exception as e:
+                logger.warning(
+                    f"[cycle] Alpaca live data failed — falling back to MOCK: {e}"
+                )
+        else:
+            logger.warning(
+                "[cycle] build_live_state unavailable (import failed) — using MOCK"
+            )
+
+    # DEMO mode or live fallback
+    market = build_demo_state(state.symbol)
+    market.data_source = "MOCK"
+    state.data_source  = "MOCK"
+    return market
 
 
 def _run_strategy(market):
@@ -147,6 +186,8 @@ def build_demo_state(symbol: str = "SPY"):
 
     Uses stable, deterministic values — no randomness — so the dashboard
     and all commands render correctly without a live data feed.
+
+    Always stamps data_source="MOCK" on the returned state.
     """
     from engine.models import (
         MarketState, IndicatorSnapshot, TrendState,
@@ -170,16 +211,16 @@ def build_demo_state(symbol: str = "SPY"):
         ("5m",  53.0, 0.02),
         ("1m",  52.0, 0.01),
     ]:
-        ind             = IndicatorSnapshot(tf, now, close)
-        ind.atr         = atr
-        ind.ema_9       = close - 0.8
-        ind.ema_20      = close - 1.5
-        ind.rsi         = rsi
-        ind.macd_hist   = macd_hist
-        ind.ema_stack   = "bull_aligned"
-        ind.vwap        = vwap
+        ind               = IndicatorSnapshot(tf, now, close)
+        ind.atr           = atr
+        ind.ema_9         = close - 0.8
+        ind.ema_20        = close - 1.5
+        ind.rsi           = rsi
+        ind.macd_hist     = macd_hist
+        ind.ema_stack     = "bull_aligned"
+        ind.vwap          = vwap
         ind.price_vs_vwap = "above"
-        ind.macd_bias   = "bullish"
+        ind.macd_bias     = "bullish"
         state.indicators[tf] = ind
 
     # Trends
@@ -219,9 +260,12 @@ def build_demo_state(symbol: str = "SPY"):
     # Intent
     state.intent = SessionIntent(min_score=60)
 
-    # Context attributes used by warnings / dashboard
+    # Context hints for warnings / dashboard
     state.context_bias       = "neutral"
     state.context_risk_level = "normal"
+
+    # Always mark synthetic data explicitly — never silent fake prices
+    state.data_source = "MOCK"
 
     return state
 
@@ -255,7 +299,6 @@ def _current_phase(now: datetime):
     """Simple session-phase approximation based on UTC hour."""
     from engine.models import SessionPhase
     h = now.hour
-    # NYSE approx: open 13:30, close 20:00 UTC
     if h < 14:
         return SessionPhase.OPEN
     if h < 18:

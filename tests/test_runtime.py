@@ -885,10 +885,20 @@ def test_startup_demo_mode():
 
 
 def test_startup_live_mode():
+    import unittest.mock as mock
+
     from runtime.run_r2 import StartupConfig, startup
     from runtime.runtime_state import SessionMode
-    c     = StartupConfig(live=True, mock_ai=True, show_dashboard=False)
-    state, _ = startup(c)
+
+    cfg = StartupConfig(live=True)
+    # Bypass _validate_alpaca so we test session_mode plumbing without real keys.
+    # Credential validation behaviour is tested in test_data_source.py.
+    with mock.patch("runtime.run_r2._show_startup_briefing"), \
+         mock.patch("runtime.run_r2._configure_logging"), \
+         mock.patch("runtime.run_r2._load_dotenv"), \
+         mock.patch("runtime.run_r2._validate_alpaca"):
+        state, _ = startup(cfg)
+
     assert state.session_mode == SessionMode.LIVE
 
 
