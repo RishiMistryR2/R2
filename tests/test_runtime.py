@@ -884,19 +884,19 @@ def test_startup_demo_mode():
     assert state.session_mode == SessionMode.DEMO
 
 
-def test_startup_live_mode():
+def test_startup_session_mode_live():
     import unittest.mock as mock
-
     from runtime.run_r2 import StartupConfig, startup
     from runtime.runtime_state import SessionMode
 
     cfg = StartupConfig(live=True)
-    # Bypass _validate_alpaca so we test session_mode plumbing without real keys.
-    # Credential validation behaviour is tested in test_data_source.py.
+    # Bypass _validate_alpaca (credential behaviour tested in test_data_source.py)
+    # and _seed_market_state (live network calls) to test session_mode plumbing only.
     with mock.patch("runtime.run_r2._show_startup_briefing"), \
          mock.patch("runtime.run_r2._configure_logging"), \
          mock.patch("runtime.run_r2._load_dotenv"), \
-         mock.patch("runtime.run_r2._validate_alpaca"):
+         mock.patch("runtime.run_r2._validate_alpaca"), \
+         mock.patch("runtime.run_r2._seed_market_state", return_value=False):
         state, _ = startup(cfg)
 
     assert state.session_mode == SessionMode.LIVE
@@ -932,7 +932,6 @@ def test_build_scheduler_intervals():
     assert d["tasks"]["update"]["interval_seconds"]            == 20.0
     assert d["tasks"]["dashboard"]["interval_seconds"]         == 8.0
     assert d["cooldowns"]["ai_commentary"]["cooldown_seconds"] == 90.0
-
 
 # ═══════════════════════════════════════════════════════════
 # Integration

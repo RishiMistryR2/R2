@@ -4,7 +4,8 @@ tests/test_phase7.py — Phase 7: CLI / operational interface.
 Coverage:
   cli/warnings.py       : all warning generators, aggregator, severity sort
   cli/setup_display.py  : setup card, for/against, R:R, stop summary
-  cli/dashboard.py      : section renders, score bar, full dashboard
+  cli/dashboard.py      : section renders, score bar, full dashboard,
+                          Recent Events word-wrapping
   cli/startup_briefing.py : briefing sections, summary line
   cli/session_summary.py : session overview, trade list, lessons
   cli/commands.py       : all handlers, dispatcher, unknown command
@@ -553,6 +554,132 @@ def test_score_bar_renders():
 
 
 # ═══════════════════════════════════════════════════════════
+# cli/dashboard.py — Recent Events word-wrapping
+# ═══════════════════════════════════════════════════════════
+
+def test_events_section_empty_returns_empty():
+    from cli.dashboard import _render_events_section
+    assert _render_events_section([]) == ""
+
+
+def test_events_section_short_event_single_line():
+    from cli.dashboard import _render_events_section
+    result = _render_events_section(["Short event"])
+    # One bullet line for the event
+    bullet_lines = [l for l in result.split("\n") if "  · " in l]
+    assert len(bullet_lines) == 1
+    assert "Short event" in bullet_lines[0]
+
+
+def test_events_section_long_event_wraps_to_multiple_lines():
+    from cli.dashboard import _render_events_section, WIDTH
+    # Text that is definitely longer than WIDTH
+    long_text = "AI [startup_briefing]: " + ("word " * 30).strip()
+    result = _render_events_section([long_text])
+    content_lines = [l for l in result.split("\n")
+                     if l.strip() and "──" not in l]
+    assert len(content_lines) > 1, (
+        "Expected wrapped lines for long event, got only 1"
+    )
+
+
+def test_events_section_first_line_has_bullet():
+    from cli.dashboard import _render_events_section
+    long_text = "AI [regime_change]: " + ("some analysis text " * 10).strip()
+    result = _render_events_section([long_text])
+    content_lines = [l for l in result.split("\n")
+                     if l.strip() and "──" not in l]
+    assert content_lines[0].startswith("  · "), (
+        f"First line should start with '  · ', got: {content_lines[0]!r}"
+    )
+
+
+def test_events_section_continuation_lines_indented_not_bulleted():
+    from cli.dashboard import _render_events_section
+    long_text = "AI [regime_change]: " + ("some detailed analysis word " * 8).strip()
+    result = _render_events_section([long_text])
+    content_lines = [l for l in result.split("\n")
+                     if l.strip() and "──" not in l]
+    if len(content_lines) > 1:
+        for cont in content_lines[1:]:
+            assert cont.startswith("    "), (
+                f"Continuation line should start with 4 spaces, got: {cont!r}"
+            )
+            assert not cont.startswith("  · "), (
+                f"Continuation line must not have bullet: {cont!r}"
+            )
+
+
+def test_events_section_all_content_present_no_truncation():
+    from cli.dashboard import _render_events_section
+    # Full AI commentary — should NOT be cut off with "…"
+    commentary = (
+        "AI [startup_briefing]: Pre-market: SPY is in a trend-bull regime with "
+        "moderate confidence. No elevated macro risk detected. The structure favors "
+        "continuation setups on pullbacks to VWAP. Watch for a clean 5m setup in "
+        "the first 30 minutes."
+    )
+    result = _render_events_section([commentary])
+    assert "…" not in result, "Commentary should not be truncated with ellipsis"
+    assert "Watch for a clean 5m setup" in result, (
+        "Full commentary text must be visible in the output"
+    )
+    assert "No elevated macro risk" in result
+
+
+def test_events_section_shows_last_4_events():
+    from cli.dashboard import _render_events_section
+    events = [f"event number {i}" for i in range(10)]
+    result = _render_events_section(events)
+    # Last 4 should appear
+    for i in range(6, 10):
+        assert f"event number {i}" in result, f"event {i} should be visible"
+    # Earlier events should not appear
+    for i in range(6):
+        assert f"event number {i}" not in result, f"event {i} should be hidden"
+
+
+def test_events_section_multiple_events_all_start_with_bullet():
+    from cli.dashboard import _render_events_section
+    events = ["first event", "second event", "third event"]
+    result = _render_events_section(events)
+    bullet_lines = [l for l in result.split("\n") if "  · " in l]
+    assert len(bullet_lines) == 3
+
+
+def test_events_section_wrapped_lines_within_dashboard_width():
+    from cli.dashboard import _render_events_section, WIDTH
+    long_text = "AI [market_commentary]: " + ("detailed analysis " * 20).strip()
+    result = _render_events_section([long_text])
+    for line in result.split("\n"):
+        assert len(line) <= WIDTH + 2, (
+            f"Line too wide ({len(line)} > {WIDTH + 2}): {line!r}"
+        )
+
+
+def test_events_section_header_present():
+    from cli.dashboard import _render_events_section
+    result = _render_events_section(["any event"])
+    assert "RECENT EVENTS" in result
+
+
+def test_dashboard_render_includes_wrapped_events():
+    """Full dashboard render with a long event shows wrapped content."""
+    from cli.dashboard import render_dashboard
+    state = _market_state()
+    long_commentary = (
+        "AI [regime_change]: Current narrative is trending-bull with aligned timeframes. "
+        "Price is holding above VWAP. RSI is in a healthy zone at 55. Regime confidence "
+        "is adequate for selective long entries on pullbacks."
+    )
+    result = render_dashboard(state, recent_events=[long_commentary])
+    assert "RECENT EVENTS" in result
+    assert "trending-bull" in result
+    assert "pullbacks" in result
+    assert "…" not in result
+
+
+# ═══════════════════════════════════════════════════════════
 # cli/startup_briefing.py
 # ═══════════════════════════════════════════════════════════
 
@@ -747,7 +874,6 @@ def test_session_summary_performance_breakdown():
 # ═══════════════════════════════════════════════════════════
 
 def _ctx(**kwargs):
-    """Build a minimal command context dict."""
     base = {
         "state":           _market_state(),
         "score":           _setup_score(),
@@ -922,7 +1048,6 @@ def test_command_result_str_failure():
 # ═══════════════════════════════════════════════════════════
 
 def test_integration_full_dashboard_cycle():
-    """Dashboard → warnings → commands all consume same state."""
     from cli.dashboard import render_dashboard
     from cli.warnings import collect_warnings
     from cli.commands import dispatch
@@ -950,7 +1075,6 @@ def test_integration_full_dashboard_cycle():
 
 
 def test_integration_startup_to_dashboard():
-    """Startup briefing feeds into dashboard without errors."""
     from cli.startup_briefing import render_startup_briefing
     from cli.dashboard import render_dashboard
 

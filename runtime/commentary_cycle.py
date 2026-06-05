@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from runtime.runtime_state import RuntimeState
+
 try:
     from ai.state_packager import build_full_package
 except Exception:  # pragma: no cover - defensive fallback for degraded runtime startup
@@ -161,22 +162,26 @@ def answer_question(state: RuntimeState, question: str) -> str:
 # ──────────────────────────────────────────────
 
 def _commit_commentary(state: RuntimeState, text: str, trigger: str) -> None:
-    """Store commentary in RuntimeState and append a brief event log entry."""
+    """
+    Store commentary in RuntimeState and append an event log entry.
+
+    The full text (whitespace collapsed) is stored without a fixed-length
+    truncation so the dashboard can display the complete narrative.
+    Long entries are wrapped at render time by _render_events_section.
+    """
     state.latest_commentary = text
     state.commentary_type   = trigger
     state.commentary_at     = datetime.now(tz=timezone.utc)
-    short = text[:80].replace("\n", " ")
-    entry = (
-        f"AI [{trigger}]: {short}…" if len(text) > 80
-        else f"AI [{trigger}]: {short}"
-    )
-    state.add_event(entry)
+
+    # Collapse internal whitespace/newlines to a single space so the
+    # event string is one logical line that the dashboard can word-wrap.
+    flat  = " ".join(text.split())
+    state.add_event(f"AI [{trigger}]: {flat}")
 
 
 def _build_fallback_answer(state: RuntimeState, question: str) -> str:
     """
     Build a data-driven answer without AI when the API is unavailable.
-    Uses current RuntimeState to provide relevant context.
     """
     lines = ["[AI unavailable]  Answering from current data:"]
 

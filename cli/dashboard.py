@@ -3,34 +3,34 @@ cli/dashboard.py — terminal dashboard renderer for R2.
 
 Pure formatting functions.  No I/O, no side effects.
 
-Layout (top to bottom):
-  ┌─ HEADER: symbol, time, session phase ─────────────────┐
-  │  MARKET STATUS: price, regime, narrative, VIX          │
-  │  READINESS + CONTEXT BIAS                              │
-  │  SETUP SCORE (if any)                                  │
-  │  ACTIVE TRADE STATUS (if any)                          │
-  │  WARNINGS                                              │
-  │  ACTIVE PATTERNS                                       │
-  │  RECENT EVENTS                                         │
-  └────────────────────────────────────────────────────────┘
+Recent Events:
+  Long entries (AI commentary) are word-wrapped across multiple lines
+  within the dashboard box rather than truncated.  The first line of each
+  event is prefixed with "  · "; continuation lines are indented with "    "
+  so they are visually associated with their parent entry.
+  Up to MAX_RECENT_EVENTS events are shown, most recent last.
 
-Design principles:
-  - Clean, information-dense, no decorative noise
-  - Every line has a purpose
-  - Calm tone: data, not drama
+Price display (MARKET section):
+  Uses current_price when stamped by build_live_state (trade/quote),
+  falls back to 5m bar close.  Source, bid/ask, spread, and last-update
+  time (ET) are shown for live-mode verification.
+
+Session display (STATUS section):
+  Uses state.market_session (MarketSession) for authoritative labels.
 """
 
 from __future__ import annotations
 
+import textwrap
+import re
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from cli.warnings import collect_warnings, render_warnings
 from cli.setup_display import render_setup_summary_line, render_for_against, render_stop_summary
 
-
-# Width constant — standard 80-col terminal
-WIDTH = 72
+WIDTH              = 72
+MAX_RECENT_EVENTS  = 4    # how many events to show in the dashboard
 
 
 # ──────────────────────────────────────────────
@@ -46,10 +46,6 @@ def render_dashboard(
     recent_events:  List[str] = None,
     now:            Optional[datetime] = None,
 ) -> str:
-    """
-    Render the complete R2 dashboard to a string.
-    Caller prints; this function only formats.
-    """
     if now is None:
         now = datetime.now(tz=timezone.utc)
 
@@ -66,17 +62,14 @@ def render_dashboard(
         sections.append(_render_active_trade(state.active_trade))
 
     warnings = collect_warnings(
-        state          = state,
-        context_state  = context_state,
-        session_memory = session_memory,
-        score          = score,
-        active_patterns = active_patterns or [],
+        state=state, context_state=context_state,
+        session_memory=session_memory, score=score,
+        active_patterns=active_patterns or [],
     )
     sections.append(_render_warnings_section(warnings))
 
     if active_patterns:
         sections.append(_render_patterns_section(active_patterns))
-
     if recent_events:
         sections.append(_render_events_section(recent_events))
 
@@ -84,7 +77,7 @@ def render_dashboard(
 
 
 # ──────────────────────────────────────────────
-# Section renderers (all return str)
+# Section renderers
 # ──────────────────────────────────────────────
 
 def _render_header(state, now: datetime) -> str:
@@ -101,40 +94,67 @@ def _render_market_status(state, context_state) -> str:
     lines: List[str] = []
     lines.append(_section_label("MARKET"))
 
-    # Price
-    ind_5m = state.indicators.get("5m") if state.indicators else None
-    if ind_5m and ind_5m.close:
-        price = ind_5m.close
-        vwap  = ind_5m.vwap
-        vwap_str = ""
-        if vwap:
-            diff     = price - vwap
-            rel      = "above" if diff > 0 else "below"
-            vwap_str = f"  VWAP {vwap:.2f} ({rel} {abs(diff):.2f})"
-        lines.append(f"  Price  : {price:.2f}{vwap_str}")
+    current_price = getattr(state, "current_price",           None)
+    price_source  = getattr(state, "current_price_source",    None)
+    price_ts      = getattr(state, "current_price_timestamp", None)
+    bid           = getattr(state, "bid",                     None)
+    ask           = getattr(state, "ask",                     None)
+    spread        = getattr(state, "spread",                  None)
+    ind_5m        = state.indicators.get("5m") if state.indicators else None
+    vwap          = ind_5m.vwap if ind_5m else None
 
-    # Regime
+    if current_price is not None:
+        price      = current_price
+        source_tag = f"  [{price_source}]" if price_source else ""
+        lines.append(f"  Price  : {price:.2f}{source_tag}")
+
+        if bid is not None and ask is not None:
+            spread_str = f"  spread {spread:.4g}" if spread is not None else ""
+            lines.append(f"  Bid/Ask: {bid:.2f} / {ask:.2f}{spread_str}")
+
+        if price_ts:
+            try:
+                from engine.market_session import to_et_string
+                lines.append(f"  Updated: {to_et_string(price_ts)}")
+            except Exception:
+                lines.append(f"  Updated: {price_ts.strftime('%H:%M:%S UTC')}")
+
+        if vwap:
+            diff = price - vwap
+            rel  = "above" if diff > 0 else "below"
+            lines.append(f"  VWAP   : {vwap:.2f}  ({rel} {abs(diff):.2f})")
+
+    elif ind_5m and ind_5m.close:
+        price = ind_5m.close
+        lines.append(f"  Price  : {price:.2f}")
+        if vwap:
+            diff = price - vwap
+            rel  = "above" if diff > 0 else "below"
+            lines.append(f"  VWAP   : {vwap:.2f}  ({rel} {abs(diff):.2f})")
+
     if state.regime:
         regime = state.regime.regime.value.replace("_", " ").title()
         conf   = f"  ({state.regime.confidence:.0%})"
-        mult   = f"  {state.regime.score_multiplier:.2f}×" if state.regime.score_multiplier != 1.0 else ""
+        mult   = (f"  {state.regime.score_multiplier:.2f}×"
+                  if state.regime.score_multiplier != 1.0 else "")
         lines.append(f"  Regime : {regime}{conf}{mult}")
 
-    # Narrative
     if state.narrative:
-        narr = state.narrative.narrative.value.replace("_", " ").title()
-        htf  = getattr(state, "htf_bias", "") or ""
+        narr    = state.narrative.narrative.value.replace("_", " ").title()
+        htf     = getattr(state, "htf_bias", "") or ""
         htf_str = f"  · HTF {htf}" if htf and htf != "neutral" else ""
         lines.append(f"  Outlook: {narr}{htf_str}")
 
-    # VIX / context
     if context_state:
         if context_state.vix_level:
-            lines.append(f"  VIX    : {context_state.vix_level:.1f}  [{context_state.vix_regime}]")
+            lines.append(
+                f"  VIX    : {context_state.vix_level:.1f}  [{context_state.vix_regime}]"
+            )
         if context_state.news_sentiment != 0:
-            sentiment = context_state.context_bias
-            score_str = f"{context_state.news_sentiment:+.2f}"
-            lines.append(f"  News   : {sentiment}  ({score_str})")
+            lines.append(
+                f"  News   : {context_state.context_bias}"
+                f"  ({context_state.news_sentiment:+.2f})"
+            )
 
     return "\n".join(lines)
 
@@ -143,14 +163,27 @@ def _render_readiness(state, context_state) -> str:
     lines: List[str] = []
     lines.append(_section_label("STATUS"))
 
+    market_session = getattr(state, "market_session", None)
+    if market_session is not None:
+        try:
+            from engine.market_session import session_label
+            sess_str = session_label(market_session)
+        except Exception:
+            sess_str = market_session.value.upper()
+        lines.append(f"  Session : {sess_str}")
+    elif state.session:
+        lines.append(
+            f"  Session : {state.session.phase.value.replace('_', ' ').upper()}"
+        )
+
     if state.session:
         r  = state.session.readiness.value.replace("_", " ").title()
-        me = "✓" if state.session.market_open else "✗"
+        me = "✓" if state.session.market_open    else "✗"
         ea = "✓" if state.session.entries_allowed else "✗"
         lines.append(f"  Readiness : {r}")
         lines.append(f"  Market    : {me}  Entries: {ea}")
 
-    ctx_bias = getattr(state, "context_bias", "neutral")
+    ctx_bias = getattr(state, "context_bias",       "neutral")
     ctx_risk = getattr(state, "context_risk_level", "normal")
     lines.append(f"  Ctx bias  : {ctx_bias}  [{ctx_risk} volatility]")
 
@@ -162,21 +195,16 @@ def _render_score_section(score, direction) -> str:
     lines.append(_section_label("SETUP SCORE"))
     lines.append(render_setup_summary_line(score, direction))
     effective = score.adjusted_total if score.adjusted_total > 0 else score.total
-    bar = _score_bar(effective)
-    lines.append(f"  {bar}")
-
-    # Component minibar
-    comps = [
+    lines.append(f"  {_score_bar(effective)}")
+    for label, val, max_val in [
         ("Align",     score.trend_alignment,   30),
         ("Momentum",  score.momentum_quality,  25),
         ("Structure", score.structure_context, 25),
-        ("Timing",    score.entry_timing,       20),
-    ]
-    for label, val, max_val in comps:
+        ("Timing",    score.entry_timing,      20),
+    ]:
         pct      = int(val / max_val * 10) if max_val else 0
         bar_part = "█" * pct + "·" * (10 - pct)
         lines.append(f"  {label:<10} {val:>4.0f}/{max_val}  {bar_part}")
-
     return "\n".join(lines)
 
 
@@ -184,8 +212,8 @@ def _render_active_trade(trade) -> str:
     lines: List[str] = []
     lines.append(_section_label("ACTIVE TRADE"))
     lifecycle  = getattr(trade.lifecycle, "value", "—") if trade.lifecycle else "—"
-    direction  = trade.direction.value.upper() if trade.direction else "—"
-    instrument = trade.instrument_type.value if trade.instrument_type else "—"
+    direction  = trade.direction.value.upper()           if trade.direction  else "—"
+    instrument = trade.instrument_type.value             if trade.instrument_type else "—"
     lines.append(f"  {direction}  ·  {instrument}  ·  [{lifecycle.upper()}]")
     entry = trade.underlying_entry_price or trade.entry_price
     if entry:
@@ -216,53 +244,110 @@ def _render_patterns_section(patterns: List[dict]) -> str:
         occ  = p.get("occurrence_count", p.get("occurrences", 0))
         wr   = p.get("win_rate", 0.0)
         lines.append(
-            f"  {pid[:36]:<36}  "
-            f"conf {conf:.0%}  wr {wr:.0%}  n={occ}"
+            f"  {pid[:36]:<36}  conf {conf:.0%}  wr {wr:.0%}  n={occ}"
         )
     return "\n".join(lines)
 
 
 def _render_events_section(events: List[str]) -> str:
+    """
+    Render the most recent events, word-wrapping long entries.
+
+    Each event occupies one or more terminal lines:
+      First line:        "  · <text>"
+      Continuation lines:"    <text>"    (4-space indent, no bullet)
+
+    Up to MAX_RECENT_EVENTS events are shown (most recent).
+    No fixed-length truncation — the full event text is always displayed.
+    """
     if not events:
         return ""
+
     lines: List[str] = []
     lines.append(_section_label("RECENT EVENTS"))
-    for ev in events[-4:]:
-        lines.append(f"  · {ev}")
+
+    wrap_width = WIDTH + 2
+
+    for ev in events[-MAX_RECENT_EVENTS:]:
+        # Prefer sentence-aware wrapping so compact risk/context phrases like
+        # "No elevated macro risk" stay intact instead of being split across
+        # line breaks. If no sentence boundaries exist, fall back to normal
+        # word wrapping.
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ev) if s.strip()]
+        chunks = sentences if len(sentences) > 1 else [ev]
+
+        first_line = True
+        for chunk in chunks:
+            wrapped = textwrap.wrap(
+                chunk,
+                width             = wrap_width,
+                initial_indent    = "  · " if first_line else "    ",
+                subsequent_indent = "    ",
+                break_long_words  = False,
+                break_on_hyphens  = False,
+            )
+            if wrapped:
+                lines.extend(wrapped)
+            else:
+                lines.append(("  · " if first_line else "    ") + chunk)
+            first_line = False
+
     return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────
-# Compact single-line renderers (for narrow views)
+# Compact single-line renderers
 # ──────────────────────────────────────────────
 
 def render_regime_line(state) -> str:
     if not state.regime:
         return "Regime: —"
-    regime = state.regime.regime.value.replace("_", " ").title()
-    conf   = f"{state.regime.confidence:.0%}"
-    return f"Regime: {regime}  {conf}"
+    return (f"Regime: {state.regime.regime.value.replace('_',' ').title()}"
+            f"  {state.regime.confidence:.0%}")
 
 
 def render_price_line(state) -> str:
-    ind = state.indicators.get("5m") if state.indicators else None
-    if not ind:
+    current_price = getattr(state, "current_price",        None)
+    price_source  = getattr(state, "current_price_source", None)
+    bid           = getattr(state, "bid",                  None)
+    ask           = getattr(state, "ask",                  None)
+    ind           = state.indicators.get("5m") if state.indicators else None
+
+    if current_price is not None:
+        price = current_price
+        if bid is not None and ask is not None:
+            price_str = f"{price:.2f}  [{bid:.2f}/{ask:.2f}]"
+        elif price_source:
+            price_str = f"{price:.2f}  [{price_source}]"
+        else:
+            price_str = f"{price:.2f}"
+    elif ind:
+        price     = ind.close
+        price_str = f"{price:.2f}"
+    else:
         return "Price: —"
-    price = ind.close
-    vwap  = ind.vwap
+
+    vwap = ind.vwap if ind else None
     if vwap:
         diff = price - vwap
-        return f"Price: {price:.2f}  VWAP {vwap:.2f}  ({diff:+.2f})"
-    return f"Price: {price:.2f}"
+        return f"Price: {price_str}  VWAP {vwap:.2f}  ({diff:+.2f})"
+    return f"Price: {price_str}"
 
 
 def render_session_line(state) -> str:
-    if not state.session:
+    market_session = getattr(state, "market_session", None)
+    if market_session is not None:
+        try:
+            from engine.market_session import session_label
+            sess = session_label(market_session)
+        except Exception:
+            sess = market_session.value.upper()
+    elif state.session:
+        sess = state.session.phase.value.upper()
+    else:
         return "Session: —"
-    phase = state.session.phase.value.upper()
-    r     = state.session.readiness.value.replace("_", " ").title()
-    open_ = "Open" if state.session.market_open else "Closed"
-    return f"Session: {phase}  ·  {r}  ·  Market {open_}"
+    open_ = "Open" if (state.session and state.session.market_open) else "Closed"
+    return f"Session: {sess}  ·  Market {open_}"
 
 
 # ──────────────────────────────────────────────
@@ -275,11 +360,8 @@ def _section_label(label: str) -> str:
 
 
 def _score_bar(score: float, width: int = 40) -> str:
-    filled = int(score / 100 * width)
-    filled = max(0, min(width, filled))
-    empty  = width - filled
-    bar    = "█" * filled + "·" * empty
-    return f"[{bar}]  {score:.0f}"
+    filled = max(0, min(width, int(score / 100 * width)))
+    return f"[{'█' * filled}{'·' * (width - filled)}]  {score:.0f}"
 
 
 def _box(content: str) -> str:

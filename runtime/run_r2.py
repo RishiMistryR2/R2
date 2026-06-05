@@ -13,15 +13,17 @@ Startup sequence:
   2. Load .env (non-fatal)
   3. Initialise RuntimeState
   4. Validate Alpaca credentials (_validate_alpaca) — sets data_source + session_mode
-  5. Load memory — non-fatal: SessionMemory, PatternMemory, StartupBriefing
-  6. Seed initial market state — non-fatal: first update cycle
-  7. Build Scheduler
-  8. Show startup briefing — non-fatal
-  9. Set status RUNNING and return
+  5. Load memory — non-fatal
+  6. Seed initial market state — explicit live attempt first, then demo fallback
+  7. Build Scheduler — marks update as done after successful seed
+  8. Show startup briefing
+  9. Set status RUNNING
 
-Safety guarantee:
-  Every step after state construction is wrapped in try/except.
-  startup() never raises — it always returns a usable (state, scheduler) pair.
+Credential reading:
+  _validate_alpaca() reads ALPACA_API_KEY and ALPACA_SECRET_KEY via os.getenv()
+  AFTER _load_dotenv() has populated the environment.  It does NOT import from
+  config.settings, which is evaluated at module-import time and would therefore
+  hold empty strings if the .env file had not yet been loaded.
 """
 
 from __future__ import annotations
@@ -33,7 +35,6 @@ import os
 import sys
 from pathlib import Path
 
-# Ensure project root is on PYTHONPATH
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -81,10 +82,7 @@ class StartupConfig:
 def startup(config: StartupConfig) -> tuple:
     """
     Execute the full startup sequence.
-
-    Returns (RuntimeState, Scheduler) ready for the runtime loop.
-    Every step after state construction is non-fatal so R2 always
-    reaches RUNNING state even when APIs are unavailable.
+    Returns (RuntimeState, Scheduler).  Never raises.
     """
     _configure_logging(config.log_level)
 
@@ -96,9 +94,10 @@ def startup(config: StartupConfig) -> tuple:
         f"  mock_ai={config.mock_ai}"
     )
 
+    # Load .env FIRST so os.getenv() calls in _validate_alpaca see the keys.
     _load_dotenv()
 
-    # Initialise state
+    # Initialise RuntimeState
     state = RuntimeState(
         symbol                      = config.symbol,
         session_mode                = SessionMode.LIVE if config.live else SessionMode.DEMO,
@@ -108,7 +107,8 @@ def startup(config: StartupConfig) -> tuple:
     )
     logger.info(f"[startup] RuntimeState created  mode={state.session_mode.value}")
 
-    # Validate Alpaca credentials — sets session_mode and data_source
+    # Validate Alpaca credentials — sets session_mode + data_source.
+    # Reads keys via os.getenv() so .env values are visible.
     _validate_alpaca(state, config)
 
     # Load memory (non-fatal)
@@ -117,14 +117,22 @@ def startup(config: StartupConfig) -> tuple:
     except Exception as e:
         logger.warning(f"[startup] _load_memory failed (non-fatal): {e}")
 
-    # Seed market state (non-fatal)
+    # Seed market state (non-fatal).
+    # For LIVE mode: calls build_live_state() directly before the loop starts
+    # so the startup briefing shows real prices, not 545.00.
+    seeded = False
     try:
-        _seed_market_state(state)
+        seeded = _seed_market_state(state)
     except Exception as e:
         logger.warning(f"[startup] _seed_market_state failed (non-fatal): {e}")
 
-    # Build scheduler
+    # Build scheduler.
+    # Mark the update task as done when state was already seeded —
+    # prevents the loop's first iteration from immediately overwriting
+    # the freshly seeded live state.
     scheduler = _build_scheduler(config)
+    if seeded:
+        scheduler.task_done("update")
 
     # Show startup briefing (non-fatal)
     if config.show_dashboard:
@@ -132,7 +140,10 @@ def startup(config: StartupConfig) -> tuple:
             _show_startup_briefing(state, config)
         except Exception as e:
             logger.warning(f"[startup] Startup briefing failed (non-fatal): {e}")
-            print(f"  R2 starting  [{state.session_mode.value} mode]", flush=True)
+            print(
+                f"  R2 starting  [{state.session_mode.value}]  [DATA:{state.data_source}]",
+                flush=True,
+            )
 
     state.status = RuntimeStatus.RUNNING
     logger.info("[startup] Startup complete — entering runtime loop")
@@ -147,11 +158,15 @@ def _validate_alpaca(state: RuntimeState, config: StartupConfig) -> None:
     """
     Validate Alpaca credentials and set state.session_mode + state.data_source.
 
+    Reads credentials via os.getenv() — NOT from config.settings constants —
+    so that values loaded by _load_dotenv() are always visible, regardless of
+    when config.settings was first imported.
+
     Outcomes:
-      config.live=False                           -> DEMO, data_source=MOCK
-      config.live=True, no keys                   -> DEMO, data_source=MOCK, WARNING
-      config.live=True, keys present, conn fails  -> DEMO, data_source=MOCK, WARNING
-      config.live=True, keys present, conn OK     -> LIVE, data_source=LIVE
+      live=False                           → DEMO, data_source=MOCK
+      live=True, env keys missing          → DEMO, data_source=MOCK, WARNING
+      live=True, keys present, conn fails  → DEMO, data_source=MOCK, WARNING
+      live=True, keys present, conn OK     → LIVE, data_source=LIVE
 
     Never raises.
     """
@@ -163,19 +178,21 @@ def _validate_alpaca(state: RuntimeState, config: StartupConfig) -> None:
         )
         return
 
-    # Live requested — check keys
-    from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+    # Read directly from the live environment — .env was loaded above.
+    api_key    = os.getenv("ALPACA_API_KEY",    "")
+    secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+
+    if not api_key or not secret_key:
         logger.warning(
             "[startup] --live requested but ALPACA_API_KEY / ALPACA_SECRET_KEY "
-            "not set in environment.  Falling back to MOCK mode.\n"
-            "         Add keys to .env or set environment variables."
+            "not found in environment.  Falling back to MOCK mode.\n"
+            "         Add keys to .env or export them before running."
         )
         state.session_mode = SessionMode.DEMO
         state.data_source  = "MOCK"
         return
 
-    # Keys present — test the connection
+    # Keys are present — test the connection.
     try:
         from engine.alpaca_feed import validate_credentials
         if validate_credentials():
@@ -198,14 +215,15 @@ def _validate_alpaca(state: RuntimeState, config: StartupConfig) -> None:
 
 
 def _load_dotenv() -> None:
+    """Load .env into the process environment.  Non-fatal."""
     try:
         from dotenv import load_dotenv
         env_path = ROOT / ".env"
         if env_path.exists():
-            load_dotenv(env_path)
+            load_dotenv(env_path, override=True)
             logger.info("[startup] .env loaded")
         else:
-            logger.info("[startup] No .env found — using environment variables")
+            logger.info("[startup] No .env found — using shell environment variables")
     except ImportError:
         logger.info("[startup] python-dotenv not installed — skipping .env load")
     except Exception as e:
@@ -268,17 +286,68 @@ def _load_memory(state: RuntimeState) -> None:
         logger.warning(f"[startup] startup_briefing failed (non-fatal): {e}")
 
 
-def _seed_market_state(state: RuntimeState) -> None:
-    """Run first update cycle to seed market state."""
+def _seed_market_state(state: RuntimeState) -> bool:
+    """
+    Seed the initial market state before the runtime loop starts.
+
+    Returns True if state.market_state was populated successfully.
+
+    LIVE mode:
+      Calls build_live_state() directly (not via run_update_cycle) so the
+      startup briefing shows real prices before the async loop starts.
+      On failure: logs a clear WARNING, falls through to demo seed.
+      data_source → "MOCK"; session_mode stays LIVE so the loop retries.
+
+    DEMO mode:
+      Calls run_update_cycle() which builds the synthetic 545.00 state.
+    """
+    if state.session_mode == SessionMode.LIVE:
+        try:
+            from engine.alpaca_feed import build_live_state as _bls
+            market = _bls(state.symbol)
+            market.data_source = "LIVE"
+            state.data_source  = "LIVE"
+
+            # Enrich with StrategyEngine (best-effort)
+            try:
+                from strategy.strategy_engine import StrategyEngine
+                market = StrategyEngine().process(market)
+            except Exception as se:
+                logger.warning(f"[startup] StrategyEngine enrichment failed: {se}")
+
+            state.market_state = market
+            state.mark_update()
+            state.health.record_success()
+
+            ind_5m = market.indicators.get("5m")
+            price  = f"@ {ind_5m.close:.2f}" if ind_5m else ""
+            logger.info(
+                f"[startup] Live state seeded: {state.symbol} {price}  [DATA:LIVE]"
+            )
+            return True
+
+        except Exception as e:
+            logger.warning(
+                f"[startup] Live seed failed ({type(e).__name__}: {e}).\n"
+                f"          Dashboard will show [DATA:MOCK] until Alpaca responds.\n"
+                f"          The update loop will keep retrying live data."
+            )
+            state.data_source = "MOCK"
+            # session_mode intentionally stays LIVE — loop keeps retrying
+
+    # DEMO mode or LIVE fallback
     try:
         from runtime.update_cycle import run_update_cycle
         ok = run_update_cycle(state)
         if ok:
-            logger.info("[startup] Initial market state seeded")
+            price = state.market_state.indicators["5m"].close
+            logger.info(f"[startup] Demo state seeded  @ {price:.2f}  [DATA:MOCK]")
         else:
-            logger.warning("[startup] Initial update cycle returned False")
+            logger.warning("[startup] Demo seed cycle returned False")
+        return ok
     except Exception as e:
-        logger.warning(f"[startup] Seed update failed (non-fatal): {e}")
+        logger.warning(f"[startup] Demo seed failed: {e}")
+        return False
 
 
 def _build_scheduler(config: StartupConfig) -> Scheduler:
@@ -307,7 +376,8 @@ def _show_startup_briefing(state: RuntimeState, config: StartupConfig) -> None:
             context_state = state.context_state,
         )
     else:
-        text = "  R2 starting in demo mode.  No prior session data."
+        src  = state.data_source
+        text = f"  R2 starting  [{state.session_mode.value} mode]  [DATA:{src}]"
     print(text, flush=True)
 
 
@@ -320,7 +390,7 @@ def run_interactive(state: RuntimeState, scheduler: Scheduler) -> None:
     from runtime.user_input import read_command_blocking, handle_command
     from runtime.update_cycle import run_update_cycle
 
-    print(f"\n  R2 ready.  Type 'help' for commands.  Type 'quit' to exit.\n")
+    print("\n  R2 ready.  Type 'help' for commands.  Type 'quit' to exit.\n")
 
     while not state.is_shutting_down():
         try:

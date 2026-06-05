@@ -1,16 +1,22 @@
 """
 AlpacaFeed: handles all market data ingestion.
 
-Two modes:
-1. WebSocket (live) — subscribes to SPY trades for real-time tick data.
-2. REST catch-up    — fetches historical bars at startup to seed candle history.
+Async WebSocket + REST seeding via AlpacaFeed class.
+Synchronous REST helpers for update_cycle: validate_credentials,
+get_latest_price, get_latest_trade_price, get_latest_quote, build_live_state.
 
-The feed calls a callback (on_tick or on_bar) whenever data arrives.
-The main engine wires these callbacks to the CandleStore.
+Current-price policy (stamped on MarketState by _stamp_current_price):
 
-Sync REST helpers (validate_credentials, get_latest_price, build_live_state)
-are defined at module level below AlpacaFeed and use `requests` so they can
-be called from synchronous update_cycle code without an event loop.
+  Priority:
+    1. Latest trade  → source = "latest_trade" | "extended_hours_trade"
+    2. Quote midpoint → source = "quote_midpoint" | "extended_hours_quote_midpoint"
+    3. 1m bar close  → source = "1m_bar_fallback"
+
+  The session (regular vs extended) is determined by engine.market_session so
+  labeling is authoritative and consistent with the dashboard.
+
+Credential policy:
+  ALPACA_API_KEY / ALPACA_SECRET_KEY are read via os.getenv() at call time.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Callable, Awaitable, Optional
 
@@ -25,33 +32,66 @@ try:
     import aiohttp
     _HAS_AIOHTTP = True
 except ImportError:
-    aiohttp = None         # type: ignore[assignment]
+    aiohttp = None          # type: ignore[assignment]
     _HAS_AIOHTTP = False
 
 try:
     import websockets
     _HAS_WEBSOCKETS = True
 except ImportError:
-    websockets = None      # type: ignore[assignment]
+    websockets = None       # type: ignore[assignment]
     _HAS_WEBSOCKETS = False
 
+import requests as _requests
+
 from config.settings import (
-    ALPACA_API_KEY,
-    ALPACA_SECRET_KEY,
     ALPACA_BASE_URL,
     ALPACA_DATA_URL,
     ALPACA_WS_URL,
+    DATA_FEED_TIMEOUT,
     SYMBOL,
     TIMEFRAMES,
     CANDLE_HISTORY,
+    ALPACA_TF_MAP,
 )
+from engine.market_session import get_market_session
 
 logger = logging.getLogger(__name__)
 
-# Type aliases
 TickCallback = Callable[[float, float, datetime], Awaitable[None]]
 BarCallback  = Callable[[dict, str], Awaitable[None]]
 
+
+# ──────────────────────────────────────────────────────────────
+# Credential helpers
+# ──────────────────────────────────────────────────────────────
+
+def _api_key() -> str:
+    return os.getenv("ALPACA_API_KEY", "")
+
+
+def _secret_key() -> str:
+    return os.getenv("ALPACA_SECRET_KEY", "")
+
+
+def _data_headers() -> dict:
+    return {
+        "APCA-API-KEY-ID":     _api_key(),
+        "APCA-API-SECRET-KEY": _secret_key(),
+        "Accept":              "application/json",
+    }
+
+
+def _ws_auth_headers() -> dict:
+    return {
+        "APCA-API-KEY-ID":     _api_key(),
+        "APCA-API-SECRET-KEY": _secret_key(),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# AlpacaFeed — async WebSocket + REST seeding
+# ══════════════════════════════════════════════════════════════
 
 class AlpacaFeed:
     """
@@ -59,97 +99,48 @@ class AlpacaFeed:
 
     Usage:
         feed = AlpacaFeed(on_tick=..., on_bar=...)
-        await feed.seed_history()   # REST catch-up before going live
-        await feed.run()            # starts WebSocket, runs forever
+        await feed.seed_history()
+        await feed.run()
     """
 
-    def __init__(
-        self,
-        on_tick: TickCallback,
-        on_bar:  BarCallback,
-    ) -> None:
-        self.on_tick = on_tick
-        self.on_bar  = on_bar
+    def __init__(self, on_tick: TickCallback, on_bar: BarCallback) -> None:
+        self.on_tick  = on_tick
+        self.on_bar   = on_bar
         self._running = False
-        self._ws = None
-
-    # ──────────────────────────────────────────
-    # REST: historical catch-up
-    # ──────────────────────────────────────────
+        self._ws      = None
 
     async def seed_history(self) -> None:
-        """
-        Fetch enough historical bars to seed all timeframe candle histories.
-        Called once at startup before the WebSocket connects.
-        """
         if not _HAS_AIOHTTP:
             logger.warning("aiohttp not installed — skipping async seed_history")
             return
-
         logger.info("Seeding historical candle data...")
-        headers = self._auth_headers()
-
-        async with aiohttp.ClientSession(headers=headers) as session:
+        async with aiohttp.ClientSession(headers=_ws_auth_headers()) as session:
             for tf in TIMEFRAMES:
-                if tf == "1m":
-                    await self._fetch_bars(session, "1Min", CANDLE_HISTORY["1m"], "1m")
-                elif tf == "5m":
-                    await self._fetch_bars(session, "5Min", CANDLE_HISTORY["5m"], "5m")
-                elif tf == "15m":
-                    await self._fetch_bars(session, "15Min", CANDLE_HISTORY["15m"], "15m")
-                elif tf == "1h":
-                    await self._fetch_bars(session, "1Hour", CANDLE_HISTORY["1h"], "1h")
-                elif tf == "1d":
-                    await self._fetch_bars(session, "1Day", CANDLE_HISTORY["1d"], "1d")
-
+                alpaca_tf = ALPACA_TF_MAP.get(tf)
+                if alpaca_tf:
+                    await self._fetch_bars(session, alpaca_tf, CANDLE_HISTORY[tf], tf)
         logger.info("Historical seed complete.")
 
-    async def _fetch_bars(
-        self,
-        session:   "aiohttp.ClientSession",
-        alpaca_tf: str,
-        limit:     int,
-        our_tf:    str,
-    ) -> None:
-        """Fetch up to `limit` bars of `alpaca_tf` for SYMBOL."""
-        url = f"{ALPACA_DATA_URL}/v2/stocks/{SYMBOL}/bars"
-        params = {
-            "timeframe": alpaca_tf,
-            "limit":     min(limit, 1000),
-            "feed":      "iex",
-            "sort":      "asc",
-        }
-
+    async def _fetch_bars(self, session, alpaca_tf, limit, our_tf):
+        url    = f"{ALPACA_DATA_URL}/v2/stocks/{SYMBOL}/bars"
+        params = {"timeframe": alpaca_tf, "limit": min(limit, 1000),
+                  "feed": "iex", "sort": "asc"}
         try:
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
-                    text = await resp.text()
-                    logger.warning(f"Failed to fetch {our_tf} bars: {resp.status} — {text}")
+                    logger.warning(f"Failed {our_tf}: {resp.status}")
                     return
-
                 data = await resp.json()
-                bars = data.get("bars", [])
-                logger.info(f"  {our_tf}: fetched {len(bars)} bars")
-
-                for bar in bars:
+                for bar in data.get("bars", []):
                     await self.on_bar(self._parse_bar(bar), our_tf)
-
+                logger.info(f"  {our_tf}: {len(data.get('bars', []))} bars")
         except Exception as e:
-            logger.error(f"Error fetching {our_tf} history: {e}")
-
-    # ──────────────────────────────────────────
-    # WebSocket: live feed
-    # ──────────────────────────────────────────
+            logger.error(f"Error fetching {our_tf}: {e}")
 
     async def run(self) -> None:
-        """
-        Connect to Alpaca WebSocket and stream live trades.
-        Reconnects automatically on disconnect.
-        """
         if not _HAS_WEBSOCKETS:
-            logger.warning("websockets not installed — live WebSocket feed unavailable")
+            logger.warning("websockets not installed — live WS unavailable")
             return
-
         self._running = True
         while self._running:
             try:
@@ -159,224 +150,262 @@ class AlpacaFeed:
                 await asyncio.sleep(5)
 
     async def _connect_and_stream(self) -> None:
-        logger.info(f"Connecting to Alpaca WebSocket: {ALPACA_WS_URL}")
-
+        logger.info(f"Connecting: {ALPACA_WS_URL}")
         async with websockets.connect(ALPACA_WS_URL) as ws:
             self._ws = ws
-            logger.info("WebSocket connected.")
-
-            await ws.send(json.dumps({
-                "action": "auth",
-                "key":    ALPACA_API_KEY,
-                "secret": ALPACA_SECRET_KEY,
-            }))
-
-            resp = json.loads(await ws.recv())
-            logger.info(f"Auth response: {resp}")
-
-            await ws.send(json.dumps({
-                "action": "subscribe",
-                "trades": [SYMBOL],
-            }))
-
-            logger.info(f"Subscribed to {SYMBOL} trades.")
-
+            await ws.send(json.dumps({"action": "auth",
+                                       "key": _api_key(), "secret": _secret_key()}))
+            logger.info(f"Auth: {json.loads(await ws.recv())}")
+            await ws.send(json.dumps({"action": "subscribe", "trades": [SYMBOL]}))
+            logger.info(f"Subscribed to {SYMBOL}.")
             async for raw in ws:
-                messages = json.loads(raw)
-                for msg in messages:
+                for msg in json.loads(raw):
                     await self._handle_message(msg)
 
-    async def _handle_message(self, msg: dict) -> None:
-        msg_type = msg.get("T")
-
-        if msg_type == "t":
-            price     = float(msg["p"])
-            volume    = float(msg["s"])
-            timestamp = _parse_ts_str(msg["t"])
-            await self.on_tick(price, volume, timestamp)
-
-        elif msg_type == "b":
-            bar = {
+    async def _handle_message(self, msg):
+        t = msg.get("T")
+        if t == "t":
+            await self.on_tick(float(msg["p"]), float(msg["s"]),
+                               _parse_ts_str(msg["t"]))
+        elif t == "b":
+            await self.on_bar({
                 "timestamp": _parse_ts_str(msg["t"]),
-                "open":      float(msg["o"]),
-                "high":      float(msg["h"]),
-                "low":       float(msg["l"]),
-                "close":     float(msg["c"]),
-                "volume":    float(msg["v"]),
-            }
-            await self.on_bar(bar, "1m")
-
-        elif msg_type == "error":
-            logger.error(f"Alpaca stream error: {msg}")
+                "open": float(msg["o"]), "high": float(msg["h"]),
+                "low":  float(msg["l"]), "close": float(msg["c"]),
+                "volume": float(msg["v"]),
+            }, "1m")
+        elif t == "error":
+            logger.error(f"Stream error: {msg}")
 
     async def stop(self) -> None:
         self._running = False
         if self._ws:
             await self._ws.close()
 
-    # ──────────────────────────────────────────
-    # Helpers
-    # ──────────────────────────────────────────
-
-    def _auth_headers(self) -> dict:
-        return {
-            "APCA-API-KEY-ID":     ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-        }
+    @staticmethod
+    def _parse_bar(raw):
+        return {"timestamp": _parse_ts_str(raw["t"]),
+                "open": float(raw["o"]), "high": float(raw["h"]),
+                "low":  float(raw["l"]), "close": float(raw["c"]),
+                "volume": float(raw["v"])}
 
     @staticmethod
-    def _parse_bar(raw: dict) -> dict:
-        return {
-            "timestamp": _parse_ts_str(raw["t"]),
-            "open":      float(raw["o"]),
-            "high":      float(raw["h"]),
-            "low":       float(raw["l"]),
-            "close":     float(raw["c"]),
-            "volume":    float(raw["v"]),
-        }
-
-    @staticmethod
-    def _parse_ts(ts_str: str) -> datetime:
-        """Parse Alpaca ISO timestamps (with or without Z suffix)."""
+    def _parse_ts(ts_str):
         return _parse_ts_str(ts_str)
 
 
 # ══════════════════════════════════════════════════════════════
-# Synchronous REST helpers  (used by update_cycle at every tick)
+# Synchronous REST helpers
 # ══════════════════════════════════════════════════════════════
-#
-# These functions do NOT require broker permissions — they only
-# call the market-data endpoint (data.alpaca.markets).
-# They use `requests` (always available) rather than the async
-# `aiohttp` used by AlpacaFeed, so they can be called from
-# synchronous update_cycle code without an event loop.
-
-import requests as _requests
-
-from config.settings import (
-    DATA_FEED_TIMEOUT,
-    ALPACA_TF_MAP,
-)
-
-
-def _data_headers() -> dict:
-    """Build auth headers for Alpaca market-data REST calls."""
-    return {
-        "APCA-API-KEY-ID":     ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-        "Accept":              "application/json",
-    }
-
 
 def validate_credentials() -> bool:
-    """
-    Test whether valid Alpaca API keys are configured by making a
-    single lightweight REST call (latest bar for SPY).
-
-    Returns True on success, False on any failure.
-    Never raises.
-    """
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+    """Test Alpaca keys via a lightweight REST call.  Never raises."""
+    if not _api_key() or not _secret_key():
         return False
     try:
-        url  = f"{ALPACA_DATA_URL}/v2/stocks/SPY/bars/latest"
         resp = _requests.get(
-            url,
-            headers = _data_headers(),
-            params  = {"feed": "iex"},
-            timeout = DATA_FEED_TIMEOUT,
+            f"{ALPACA_DATA_URL}/v2/stocks/SPY/bars/latest",
+            headers=_data_headers(), params={"feed": "iex"},
+            timeout=DATA_FEED_TIMEOUT,
         )
         if resp.status_code == 200:
-            bar = resp.json().get("bar", {})
-            return bool(bar.get("c"))
-        logger.warning(
-            f"[alpaca] validate_credentials HTTP {resp.status_code}: {resp.text[:120]}"
-        )
+            return bool(resp.json().get("bar", {}).get("c"))
+        logger.warning(f"[alpaca] validate HTTP {resp.status_code}: {resp.text[:120]}")
         return False
     except Exception as e:
-        logger.warning(f"[alpaca] validate_credentials failed: {e}")
+        logger.warning(f"[alpaca] validate failed: {e}")
         return False
 
 
 def get_latest_price(symbol: str = "SPY") -> Optional[float]:
-    """
-    Return the most recent close price for *symbol* from Alpaca IEX feed.
-    Returns None on any failure.
-    """
+    """Return most recent bar close for *symbol*.  Never raises."""
     try:
-        url  = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars/latest"
         resp = _requests.get(
-            url,
-            headers = _data_headers(),
-            params  = {"feed": "iex"},
-            timeout = DATA_FEED_TIMEOUT,
+            f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars/latest",
+            headers=_data_headers(), params={"feed": "iex"},
+            timeout=DATA_FEED_TIMEOUT,
         )
         if resp.status_code == 200:
-            bar = resp.json().get("bar", {})
-            c   = bar.get("c")
+            c = resp.json().get("bar", {}).get("c")
             return float(c) if c is not None else None
-        logger.warning(f"[alpaca] get_latest_price HTTP {resp.status_code}")
         return None
     except Exception as e:
         logger.warning(f"[alpaca] get_latest_price failed: {e}")
         return None
 
 
-def _fetch_bars_sync(
-    symbol:        str,
-    alpaca_tf:     str,
-    limit:         int,
-    lookback_days: int,
-) -> list:
+def get_latest_trade_price(symbol: str = "SPY") -> Optional[tuple]:
     """
-    Fetch up to *limit* bars for *symbol* at *alpaca_tf* granularity.
-    Returns a list of normalised bar dicts.
-    Raises on HTTP error so callers can catch and fall back.
+    Fetch the most recent trade from Alpaca (regular + extended hours).
+
+    Returns (price: float, timestamp: datetime) or None on any failure.
+    The timestamp may be from a previous session (e.g. yesterday's close)
+    when called outside trading hours — callers should check the age.
+    Never raises.
     """
+    try:
+        resp = _requests.get(
+            f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest",
+            headers=_data_headers(), params={"feed": "iex"},
+            timeout=DATA_FEED_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            trade = resp.json().get("trade", {})
+            price = trade.get("p")
+            ts    = trade.get("t")
+            if price is not None:
+                return float(price), (_parse_ts_str(ts) if ts else None)
+        return None
+    except Exception as e:
+        logger.warning(f"[alpaca] get_latest_trade_price failed: {e}")
+        return None
+
+
+def get_latest_quote(symbol: str = "SPY") -> Optional[dict]:
+    """
+    Fetch the most recent NBBO quote from Alpaca.
+
+    Returns dict {bid, ask, bid_size, ask_size, midpoint, spread, timestamp}
+    or None on any failure.  Never raises.
+    """
+    try:
+        resp = _requests.get(
+            f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/quotes/latest",
+            headers=_data_headers(), params={"feed": "iex"},
+            timeout=DATA_FEED_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            q   = resp.json().get("quote", {})
+            bid = q.get("bp")
+            ask = q.get("ap")
+            if bid is not None and ask is not None:
+                bid, ask = float(bid), float(ask)
+                return {
+                    "bid":       bid,
+                    "ask":       ask,
+                    "bid_size":  int(q.get("bs", 0)),
+                    "ask_size":  int(q.get("as", 0)),
+                    "midpoint":  round((bid + ask) / 2, 4),
+                    "spread":    round(ask - bid, 4),
+                    "timestamp": _parse_ts_str(q["t"]) if q.get("t") else None,
+                }
+        return None
+    except Exception as e:
+        logger.warning(f"[alpaca] get_latest_quote failed: {e}")
+        return None
+
+
+def _stamp_current_price(state, symbol: str, bar_fallback: float) -> None:
+    """
+    Fetch the best available current price and stamp it on *state*.
+
+    Source priority:  latest trade  >  quote midpoint  >  1m bar close
+    The source label reflects both what was used AND the current session:
+
+      regular hours   → "latest_trade"               / "quote_midpoint"
+      extended hours  → "extended_hours_trade"        / "extended_hours_quote_midpoint"
+      any session     → "1m_bar_fallback"  (when trade+quote unavailable)
+
+    Stamped attributes (dynamic — use getattr with fallback in callers):
+      current_price              float
+      current_price_source       str
+      current_price_timestamp    datetime | None
+      bid                        float | None
+      ask                        float | None
+      spread                     float | None
+    """
+    from engine.market_session import is_extended_hours
+
+    session = get_market_session()
+    ext     = is_extended_hours(session)
+
+    # ── 1. Latest trade ────────────────────────────────────
+    trade = get_latest_trade_price(symbol)
+    if trade:
+        price, ts = trade
+        state.current_price           = price
+        state.current_price_source    = "extended_hours_trade" if ext else "latest_trade"
+        state.current_price_timestamp = ts
+        state.bid    = None
+        state.ask    = None
+        state.spread = None
+        logger.debug(
+            f"[alpaca] current_price={price:.4f}"
+            f"  source={state.current_price_source}"
+        )
+        return
+
+    # ── 2. Quote midpoint ───────────────────────────────────
+    quote = get_latest_quote(symbol)
+    if quote:
+        state.current_price           = quote["midpoint"]
+        state.current_price_source    = (
+            "extended_hours_quote_midpoint" if ext else "quote_midpoint"
+        )
+        state.current_price_timestamp = quote["timestamp"]
+        state.bid    = quote["bid"]
+        state.ask    = quote["ask"]
+        state.spread = quote["spread"]
+        logger.debug(
+            f"[alpaca] current_price={quote['midpoint']:.4f}"
+            f"  source={state.current_price_source}"
+            f"  bid={quote['bid']}  ask={quote['ask']}"
+        )
+        return
+
+    # ── 3. 1m bar close fallback ────────────────────────────
+    state.current_price           = bar_fallback
+    state.current_price_source    = "1m_bar_fallback"
+    state.current_price_timestamp = None
+    state.bid    = None
+    state.ask    = None
+    state.spread = None
+    logger.debug(
+        f"[alpaca] current_price={bar_fallback:.4f}"
+        f"  source=1m_bar_fallback (trade+quote unavailable)"
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# Internal bar-fetch helper
+# ──────────────────────────────────────────────────────────────
+
+def _fetch_bars_sync(symbol, alpaca_tf, limit, lookback_days):
     start_iso = (
         datetime.now(tz=timezone.utc) - timedelta(days=lookback_days)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    url    = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": alpaca_tf,
-        "start":     start_iso,
-        "limit":     min(limit, 1000),
-        "feed":      "iex",
-        "sort":      "asc",
-    }
     resp = _requests.get(
-        url, headers=_data_headers(), params=params, timeout=DATA_FEED_TIMEOUT
+        f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars",
+        headers=_data_headers(),
+        params={"timeframe": alpaca_tf, "start": start_iso,
+                "limit": min(limit, 1000), "feed": "iex", "sort": "asc"},
+        timeout=DATA_FEED_TIMEOUT,
     )
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"Alpaca bars HTTP {resp.status_code}: {resp.text[:200]}"
-        )
-    raw_bars = resp.json().get("bars", [])
+        raise RuntimeError(f"Alpaca bars HTTP {resp.status_code}: {resp.text[:200]}")
     return [
         {
             "timestamp": _parse_ts_str(b["t"]),
-            "open":      float(b["o"]),
-            "high":      float(b["h"]),
-            "low":       float(b["l"]),
-            "close":     float(b["c"]),
+            "open":      float(b["o"]), "high":  float(b["h"]),
+            "low":       float(b["l"]), "close": float(b["c"]),
             "volume":    float(b.get("v", 0)),
             "vwap":      float(b["vw"]) if b.get("vw") else float(b["c"]),
         }
-        for b in raw_bars
+        for b in resp.json().get("bars", [])
     ]
 
 
 def _parse_ts_str(ts_str: str) -> datetime:
-    ts_str = ts_str.replace("Z", "+00:00")
-    return datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(
+        ts_str.replace("Z", "+00:00")
+    ).replace(tzinfo=timezone.utc)
 
 
 # ──────────────────────────────────────────────────────────────
-# Indicator maths (pure Python, no numpy required)
+# Indicator maths (pure Python)
 # ──────────────────────────────────────────────────────────────
 
-def _ema(closes: list, period: int) -> float:
+def _ema(closes, period):
     if not closes:
         return 0.0
     if len(closes) < period:
@@ -388,7 +417,7 @@ def _ema(closes: list, period: int) -> float:
     return round(val, 4)
 
 
-def _rsi(closes: list, period: int = 14) -> float:
+def _rsi(closes, period=14):
     if len(closes) <= period:
         return 50.0
     recent = closes[-(period + 1):]
@@ -404,72 +433,68 @@ def _rsi(closes: list, period: int = 14) -> float:
     return round(100 - (100 / (1 + avg_g / avg_l)), 2)
 
 
-def _atr(bars: list, period: int = 14) -> float:
+def _atr(bars, period=14):
     if len(bars) < 2:
         return 1.0
-    trs = []
-    for i in range(1, len(bars)):
-        h, l, pc = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    trs = [
+        max(bars[i]["high"] - bars[i]["low"],
+            abs(bars[i]["high"] - bars[i - 1]["close"]),
+            abs(bars[i]["low"]  - bars[i - 1]["close"]))
+        for i in range(1, len(bars))
+    ]
     recent = trs[-period:]
     return round(sum(recent) / len(recent), 4) if recent else 1.0
 
 
-def _session_vwap(bars: list) -> float:
-    """Volume-weighted average price over the provided bars."""
-    total_vol = sum(b["volume"] for b in bars)
-    if total_vol == 0:
+def _session_vwap(bars):
+    vol = sum(b["volume"] for b in bars)
+    if vol == 0:
         return bars[-1]["close"] if bars else 0.0
-    return round(
-        sum(b["close"] * b["volume"] for b in bars) / total_vol, 2
-    )
+    return round(sum(b["close"] * b["volume"] for b in bars) / vol, 2)
 
 
-def _macd_components(closes: list) -> tuple:
-    """Returns (macd_line, approx_histogram, bias_str)."""
+def _macd_components(closes):
     if len(closes) < 27:
         return 0.0, 0.0, "neutral"
-    ema12 = _ema(closes, 12)
-    ema26 = _ema(closes, 26)
-    line  = ema12 - ema26
-    bias  = "bullish" if line > 0 else "bearish" if line < 0 else "neutral"
-    return line, round(line, 4), bias
+    line = _ema(closes, 12) - _ema(closes, 26)
+    return line, round(line, 4), ("bullish" if line > 0 else "bearish" if line < 0 else "neutral")
 
 
-def _swing_levels(bars: list, lookback: int = 20) -> tuple:
-    """Return (swing_low, swing_high) from recent bars."""
+def _swing_levels(bars, lookback=20):
     recent = bars[-lookback:] if len(bars) >= lookback else bars
-    lows   = [b["low"]  for b in recent]
-    highs  = [b["high"] for b in recent]
-    return min(lows), max(highs)
+    return min(b["low"] for b in recent), max(b["high"] for b in recent)
 
 
 # ──────────────────────────────────────────────────────────────
-# build_live_state  — the main public entry point for live data
+# build_live_state
 # ──────────────────────────────────────────────────────────────
 
 def build_live_state(symbol: str = "SPY"):
     """
     Build a fully-populated MarketState from real Alpaca REST data.
 
-    Fetches bars for all priority timeframes, calculates indicators,
-    and infers regime / narrative from recent price action.
+    Bars → indicators + regime + narrative.
+    Trade/quote → current_price (more recent than completed bar close).
+    MarketSession → correct session phase and label.
 
-    Raises on failure — caller must catch and fall back to demo state.
-    Requires valid ALPACA_API_KEY / ALPACA_SECRET_KEY in environment.
+    Raises on failure — caller catches and falls back to demo state.
     """
     from engine.models import (
         MarketState, IndicatorSnapshot, TrendState,
         Direction, TrendStrength,
         RegimeState, MarketRegime,
         NarrativeState, MarketNarrative,
-        SessionState, SessionPhase, Readiness,
+        SessionState, Readiness,
         SupportResistanceLevel, SessionIntent,
     )
+    from engine.market_session import (
+        get_market_session, to_session_phase, is_regular_hours, MarketSession,
+    )
 
-    now = datetime.now(tz=timezone.utc)
+    now     = datetime.now(tz=timezone.utc)
+    session = get_market_session(now)
+    phase   = to_session_phase(session)
 
-    # (tf_label, alpaca_tf_string, lookback_days, limit)
     TF_CONFIG = [
         ("1d",  "1Day",  60,  60),
         ("1h",  "1Hour", 10,  80),
@@ -481,201 +506,139 @@ def build_live_state(symbol: str = "SPY"):
     all_bars: dict = {}
     for tf_name, alpaca_tf, lookback, limit in TF_CONFIG:
         try:
-            bars = _fetch_bars_sync(symbol, alpaca_tf, limit, lookback)
-            all_bars[tf_name] = bars
-            logger.debug(f"[alpaca] {tf_name}: {len(bars)} bars")
+            all_bars[tf_name] = _fetch_bars_sync(symbol, alpaca_tf, limit, lookback)
+            logger.debug(f"[alpaca] {tf_name}: {len(all_bars[tf_name])} bars")
         except Exception as e:
             logger.warning(f"[alpaca] {tf_name} bars failed: {e}")
             all_bars[tf_name] = []
 
-    # Need 5m bars at minimum to build a useful state
     bars_5m = all_bars.get("5m", [])
     if not bars_5m:
-        raise ValueError(
-            f"No 5m bars returned for {symbol} — Alpaca unavailable?"
-        )
+        raise ValueError(f"No 5m bars for {symbol} — Alpaca unavailable?")
 
-    latest_close = bars_5m[-1]["close"]
+    latest_bar_close = bars_5m[-1]["close"]
 
-    # ── Build IndicatorSnapshots ────────────────────────────
+    # ── Indicators ──────────────────────────────────────────
     indicators = {}
     for tf_name, _, _, _ in TF_CONFIG:
         bars = all_bars.get(tf_name, [])
         if not bars:
-            ind = IndicatorSnapshot(tf_name, now, latest_close)
-            indicators[tf_name] = ind
+            indicators[tf_name] = IndicatorSnapshot(tf_name, now, latest_bar_close)
             continue
-
         closes = [b["close"] for b in bars]
         last   = bars[-1]
         close  = last["close"]
-
-        ind             = IndicatorSnapshot(tf_name, now, close)
-        ind.atr         = _atr(bars)
-        ind.ema_9       = _ema(closes, 9)
-        ind.ema_20      = _ema(closes, 20)
-        ind.rsi         = _rsi(closes)
+        ind               = IndicatorSnapshot(tf_name, now, close)
+        ind.atr           = _atr(bars)
+        ind.ema_9         = _ema(closes, 9)
+        ind.ema_20        = _ema(closes, 20)
+        ind.rsi           = _rsi(closes)
         _, ind.macd_hist, ind.macd_bias = _macd_components(closes)
-
-        ind.vwap = last.get("vwap") or _session_vwap(bars[-60:])
-        ind.price_vs_vwap = (
-            "above" if close > ind.vwap else
-            "below" if close < ind.vwap else "at"
-        )
-
-        if close > ind.ema_9 > ind.ema_20:
-            ind.ema_stack = "bull_aligned"
-        elif close < ind.ema_9 < ind.ema_20:
-            ind.ema_stack = "bear_aligned"
-        else:
-            ind.ema_stack = "mixed"
-
+        ind.vwap          = last.get("vwap") or _session_vwap(bars[-60:])
+        ind.price_vs_vwap = ("above" if close > ind.vwap else
+                              "below" if close < ind.vwap else "at")
+        ind.ema_stack     = ("bull_aligned" if close > ind.ema_9 > ind.ema_20 else
+                              "bear_aligned" if close < ind.ema_9 < ind.ema_20 else
+                              "mixed")
         indicators[tf_name] = ind
 
-    # ── TrendStates ─────────────────────────────────────────
+    # ── Trends ──────────────────────────────────────────────
     trends = {}
     for tf_name, _, _, _ in TF_CONFIG:
         bars   = all_bars.get(tf_name, [])
-        closes = [b["close"] for b in bars] if bars else [latest_close]
-
+        closes = [b["close"] for b in bars] if bars else [latest_bar_close]
+        pct    = 0.0
         if len(closes) >= 10:
-            recent_avg = sum(closes[-5:]) / 5
-            prior_avg  = sum(closes[-10:-5]) / 5
-            pct_chg    = (recent_avg - prior_avg) / prior_avg * 100 if prior_avg else 0
+            ra  = sum(closes[-5:]) / 5
+            pa  = sum(closes[-10:-5]) / 5
+            pct = (ra - pa) / pa * 100 if pa else 0
+        if pct > 0.3:
+            d, s = Direction.BULLISH, (TrendStrength.STRONG if pct > 1.0 else TrendStrength.MODERATE)
+        elif pct < -0.3:
+            d, s = Direction.BEARISH, (TrendStrength.STRONG if pct < -1.0 else TrendStrength.MODERATE)
         else:
-            pct_chg = 0.0
-
-        if pct_chg > 0.3:
-            direction = Direction.BULLISH
-            strength  = TrendStrength.STRONG if pct_chg > 1.0 else TrendStrength.MODERATE
-        elif pct_chg < -0.3:
-            direction = Direction.BEARISH
-            strength  = TrendStrength.STRONG if pct_chg < -1.0 else TrendStrength.MODERATE
-        else:
-            direction = Direction.NEUTRAL
-            strength  = TrendStrength.WEAK
-
-        tr = TrendState(tf_name, direction, strength)
-        tr.higher_highs = (direction == Direction.BULLISH)
-
+            d, s = Direction.NEUTRAL, TrendStrength.WEAK
+        tr              = TrendState(tf_name, d, s)
+        tr.higher_highs = (d == Direction.BULLISH)
         if bars:
-            swing_low, swing_high  = _swing_levels(bars)
-            tr.last_swing_low      = swing_low
-            tr.last_swing_high     = swing_high
+            tr.last_swing_low, tr.last_swing_high = _swing_levels(bars)
         else:
-            tr.last_swing_low  = latest_close * 0.992
-            tr.last_swing_high = latest_close * 1.008
-
+            tr.last_swing_low  = latest_bar_close * 0.992
+            tr.last_swing_high = latest_bar_close * 1.008
         trends[tf_name] = tr
 
     # ── Support / Resistance ─────────────────────────────────
-    swing_low_5m, swing_high_5m = _swing_levels(bars_5m, lookback=40)
-    support_levels    = [SupportResistanceLevel(round(swing_low_5m,  2), "support",    3)]
-    resistance_levels = [SupportResistanceLevel(round(swing_high_5m, 2), "resistance", 3)]
+    sl, sh = _swing_levels(bars_5m, lookback=40)
+    support_levels    = [SupportResistanceLevel(round(sl, 2), "support",    3)]
+    resistance_levels = [SupportResistanceLevel(round(sh, 2), "resistance", 3)]
 
-    # ── Regime from 1h + 15m alignment ──────────────────────
-    dir_1h  = trends.get("1h",  TrendState("1h",  Direction.NEUTRAL, TrendStrength.WEAK)).direction
-    dir_15m = trends.get("15m", TrendState("15m", Direction.NEUTRAL, TrendStrength.WEAK)).direction
-
-    if dir_1h == Direction.BULLISH and dir_15m == Direction.BULLISH:
-        regime    = MarketRegime.TREND_BULL
-        regime_cf = 0.75
-        entry_ok  = True
-        caution   = ""
+    # ── Regime ──────────────────────────────────────────────
+    dir_1h, dir_15m = trends["1h"].direction, trends["15m"].direction
+    if   dir_1h == Direction.BULLISH and dir_15m == Direction.BULLISH:
+        regime, rc, ok, caution = MarketRegime.TREND_BULL, 0.75, True,  ""
     elif dir_1h == Direction.BEARISH and dir_15m == Direction.BEARISH:
-        regime    = MarketRegime.TREND_BEAR
-        regime_cf = 0.75
-        entry_ok  = True
-        caution   = ""
-    elif dir_1h == Direction.NEUTRAL and dir_15m == Direction.NEUTRAL:
-        regime    = MarketRegime.RANGE
-        regime_cf = 0.55
-        entry_ok  = False
-        caution   = "No directional trend — wait for breakout"
+        regime, rc, ok, caution = MarketRegime.TREND_BEAR, 0.75, True,  ""
+    elif dir_1h == Direction.NEUTRAL  and dir_15m == Direction.NEUTRAL:
+        regime, rc, ok, caution = MarketRegime.RANGE,      0.55, False, "No trend — wait for breakout"
     else:
-        regime    = MarketRegime.CHOP
-        regime_cf = 0.55
-        entry_ok  = False
-        caution   = "Mixed timeframe signals — reduce size"
+        regime, rc, ok, caution = MarketRegime.CHOP,       0.55, False, "Mixed signals — reduce size"
 
-    score_mult = 1.0 if entry_ok else 0.7
+    # During extended/closed hours, disable new entries
+    if not is_regular_hours(session):
+        ok = False
+        caution = caution or f"{session.value} — no new entries"
+
+    score_mult = 1.0 if ok else 0.7
 
     # ── Narrative ────────────────────────────────────────────
-    if regime == MarketRegime.TREND_BULL:
-        narrative     = MarketNarrative.TRENDING_BULL
-        trade_posture = "long_bias"
-        narr_cf       = 0.78
-        narr_desc     = "Bullish trend across timeframes"
-    elif regime == MarketRegime.TREND_BEAR:
-        narrative     = MarketNarrative.TRENDING_BEAR
-        trade_posture = "short_bias"
-        narr_cf       = 0.78
-        narr_desc     = "Bearish trend across timeframes"
-    elif regime == MarketRegime.RANGE:
-        narrative     = MarketNarrative.RANGING
-        trade_posture = "neutral"
-        narr_cf       = 0.60
-        narr_desc     = "Price ranging — mean-reversion favoured"
-    else:
-        narrative     = MarketNarrative.CHOPPY
-        trade_posture = "neutral"
-        narr_cf       = 0.55
-        narr_desc     = "Choppy — wait for clarity"
+    _NAR = {
+        MarketRegime.TREND_BULL: (MarketNarrative.TRENDING_BULL, "long_bias",  0.78, "Bullish trend"),
+        MarketRegime.TREND_BEAR: (MarketNarrative.TRENDING_BEAR, "short_bias", 0.78, "Bearish trend"),
+        MarketRegime.RANGE:      (MarketNarrative.CHOP,       "neutral",    0.60, "Ranging"),
+        MarketRegime.CHOP:       (MarketNarrative.CHOP,        "neutral",    0.55, "Choppy"),
+    }
+    narrative, posture, ncf, ndesc = _NAR.get(
+        regime, (MarketNarrative.CHOP, "neutral", 0.55, "Unclear")
+    )
 
-    # ── Session phase ────────────────────────────────────────
-    h = now.hour
-    if h < 14:
-        phase = SessionPhase.OPEN
-    elif h < 18:
-        phase = SessionPhase.MIDDAY
-    else:
-        phase = SessionPhase.POWER_HOUR
-
-    # ── Assemble MarketState ─────────────────────────────────
+    # ── Assemble ─────────────────────────────────────────────
     state = MarketState(symbol=symbol, timestamp=now)
-
     for tf_name in ("1d", "1h", "15m", "5m", "1m"):
         state.indicators[tf_name] = indicators[tf_name]
         state.trends[tf_name]     = trends[tf_name]
-
     state.support_levels    = support_levels
     state.resistance_levels = resistance_levels
-
     state.session = SessionState(
-        phase           = phase,
-        market_open     = True,
-        entries_allowed = entry_ok,
-        score_modifier  = score_mult,
-        entry_filter    = "normal",
-        phase_note      = "live data",
-        readiness       = Readiness.FULLY_READY,
+        phase=phase, market_open=is_regular_hours(session),
+        entries_allowed=ok, score_modifier=score_mult,
+        entry_filter="normal", phase_note="live data",
+        readiness=Readiness.FULLY_READY,
     )
-
     state.regime = RegimeState(
-        regime,
-        confidence       = regime_cf,
-        score_multiplier = score_mult,
-        entry_permitted  = entry_ok,
-        caution_note     = caution,
+        regime, confidence=rc, score_multiplier=score_mult,
+        entry_permitted=ok, caution_note=caution,
     )
-
     state.narrative = NarrativeState(
-        narrative     = narrative,
-        confidence    = narr_cf,
-        description   = narr_desc,
-        trade_posture = trade_posture,
+        narrative=narrative, confidence=ncf,
+        description=ndesc, trade_posture=posture,
     )
-
-    state.intent = SessionIntent(min_score=60)
-
+    state.intent             = SessionIntent(min_score=60)
     state.context_bias       = "neutral"
     state.context_risk_level = "normal"
+    state.data_source        = "LIVE"
+    state.market_session     = session   # authoritative MarketSession enum
 
-    # Always tag explicitly — no silent fake prices
-    state.data_source = "LIVE"
+    # Current price (trade > quote > 1m bar close)
+    bars_1m      = all_bars.get("1m", [])
+    bar_1m_close = bars_1m[-1]["close"] if bars_1m else latest_bar_close
+    _stamp_current_price(state, symbol, bar_1m_close)
 
     logger.info(
-        f"[alpaca] Live state built: {symbol} @ {latest_close:.2f}"
+        f"[alpaca] Live state: {symbol}"
+        f"  bar={latest_bar_close:.2f}"
+        f"  current={state.current_price:.2f}"
+        f"  src={state.current_price_source}"
+        f"  session={session.value}"
         f"  regime={regime.value}"
     )
     return state
