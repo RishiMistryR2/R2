@@ -124,39 +124,9 @@ def _generate_mock_response(request_type: str, package: StatePackage) -> str:
 
     # ── Build by request type ────────────────────────────────
 
-    if request_type == "startup_briefing":
-        parts = [f"{sess_label}: SPY is in a {regime} regime."]
-        if direction and seq:
-            parts.append(f"Structure shows {direction} ({seq} on 5m).")
-        if mkt_state:
-            parts.append(f"Market state: {mkt_state}.")
-        if buyer:
-            parts.append(buyer)
-        if seller:
-            parts.append(seller)
-        if missing:
-            parts.append(missing)
-        parts.append(closing)
-        return " ".join(parts)
-
-    if request_type == "market_commentary":
-        parts = []
-        if direction and seq:
-            parts.append(f"Structure shows {direction} ({seq} on 5m).")
-        if mkt_state:
-            parts.append(f"Market state: {mkt_state}.")
-        if buyer:
-            parts.append(buyer)
-        if seller:
-            parts.append(seller)
-        if missing:
-            parts.append(missing)
-        if not parts:
-            # Minimal fallback if no structure — use regime + narrative
-            parts.append(f"Regime is {regime}.")
-            if narrative:
-                parts.append(f"Narrative: {narrative}.")
-        return " ".join(parts)
+    if request_type in ("startup_briefing", "market_commentary"):
+        from engine.narrative_engine import build_narrative_from_package
+        return build_narrative_from_package(d)
 
     if request_type == "setup_explanation":
         score = setup_d.get("adjusted_total") or setup_d.get("total") or 0

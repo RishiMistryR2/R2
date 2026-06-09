@@ -270,33 +270,48 @@ def _commit_commentary(state: RuntimeState, text: str, trigger: str) -> None:
 
 
 def _build_fallback_answer(state: RuntimeState, question: str) -> str:
-    """Data-driven answer without AI when the API is unavailable."""
-    lines = ["[AI unavailable]  Answering from current data:"]
+    """
+    Produce trader-quality commentary without the AI API.
+    Delegates to the Structure Narrative Engine for flowing prose.
+    """
+    from engine.narrative_engine import build_narrative
 
-    # Lead with structure if available
-    struct = getattr(state, "structure_state", None)
-    if struct:
-        lines.append(
-            f"  Structure: {struct.trend.direction} | {struct.trend.sequence_str()} "
-            f"| state={struct.market_state.state.value}"
-        )
-        if struct.structure_narrative:
-            lines.append(f"  {struct.structure_narrative}")
+    struct   = getattr(state, "structure_state", None)
+    ms       = getattr(getattr(state, "market_state", None), "market_session", None)
+    regime   = ""
+    entries  = True
+    price    = None
 
-    if state.market_state and state.market_state.regime:
-        regime = state.market_state.regime.regime.value.replace("_", " ").title()
-        lines.append(f"  Regime: {regime}  ({state.market_state.regime.confidence:.0%})")
+    if state.market_state:
+        if state.market_state.regime:
+            regime = state.market_state.regime.regime.value
+        if state.market_state.session:
+            entries = state.market_state.session.entries_allowed
+        price = getattr(state.market_state, "current_price", None)
+        if price is None:
+            ind_5m = (state.market_state.indicators or {}).get("5m")
+            if ind_5m:
+                price = getattr(ind_5m, "close", None)
 
+    narrative = build_narrative(
+        struct,
+        session=ms,
+        regime=regime,
+        entries_allowed=entries,
+        current_price=price,
+    )
+
+    suffix: list[str] = []
     if state.setup_score:
         eff = (state.setup_score.adjusted_total
                if state.setup_score.adjusted_total > 0
                else state.setup_score.total)
-        lines.append(f"  Setup score: {eff:.0f}/100  [{state.setup_score.grade()}]")
-
+        suffix.append(f"[Setup: {eff:.0f}/100 {state.setup_score.grade()}]")
     if state.active_warnings:
-        lines.append(f"  Active warnings: {len(state.active_warnings)}")
         for w in state.active_warnings[:2]:
-            lines.append(f"    · {w.message}")
+            suffix.append(f"[Warning: {w.message}]")
 
-    lines.append("  Review the dashboard for full detail.")
-    return "\n".join(lines)
+    prefix = "[AI unavailable] "
+    if suffix:
+        return prefix + narrative + "  " + "  ".join(suffix)
+    return prefix + narrative
