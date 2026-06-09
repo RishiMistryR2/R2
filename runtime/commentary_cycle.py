@@ -103,6 +103,7 @@ def generate_commentary(
             session_memory = state.session_memory,
             pattern_memory = state.pattern_memory,
             warnings       = state.active_warnings,
+            structure_state = state.structure_state,
             request_type   = trigger,
         )
 

@@ -627,6 +627,7 @@ def build_live_state(symbol: str = "SPY"):
     state.context_risk_level = "normal"
     state.data_source        = "LIVE"
     state.market_session     = session   # authoritative MarketSession enum
+    state.bars               = all_bars  # store raw bars for structure engine
 
     # Current price (trade > quote > 1m bar close)
     bars_1m      = all_bars.get("1m", [])

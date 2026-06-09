@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
 
 from runtime.runtime_state import RuntimeState, SessionMode
 
@@ -42,11 +42,20 @@ def run_update_cycle(state: RuntimeState) -> bool:
             logger.warning("[cycle] No market state — skipping")
             return False
 
-        market   = _run_strategy(market)
+        market = _run_strategy(market)
+
+        # Structure engine (non-fatal — never halts market processing)
+        structure = None
+        try:
+            structure = _run_structure_engine(market)
+        except Exception as _se:
+            logger.warning(f"[cycle] Structure engine exception: {_se}")
+
         ctx      = _get_context(state)
         warnings = _build_warnings(market, ctx, state)
 
         state.market_state         = market
+        state.structure_state      = structure
         state.context_state        = ctx
         state.active_warnings      = warnings
         state.max_warning_severity = _max_severity(warnings)
@@ -138,6 +147,19 @@ def _build_warnings(market, ctx, state: RuntimeState) -> list:
         return []
 
 
+def _run_structure_engine(market) -> "Optional[Any]":
+    """
+    Run Market Structure Engine against current MarketState.
+    Returns StructureState, or None on failure.
+    Never raises — structure failure must not halt market processing.
+    """
+    try:
+        from engine.structure_engine import analyze
+        return analyze(market)
+    except Exception as e:
+        logger.warning(f"[cycle] StructureEngine error: {e}")
+        return None
+
 # ──────────────────────────────────────────────
 # Demo / synthetic state builder
 # ──────────────────────────────────────────────
@@ -208,6 +230,7 @@ def build_demo_state(symbol: str = "SPY"):
     state.intent             = SessionIntent(min_score=60)
     state.context_bias       = "neutral"
     state.context_risk_level = "normal"
+    state.bars               = _build_demo_bars(close=close, atr=atr)
     state.data_source        = "MOCK"
     state.market_session     = session   # real session, synthetic price
 
@@ -229,9 +252,47 @@ def _get_or_create_engine():
     return _engine_instance
 
 
+
 def reset_engine() -> None:
     global _engine_instance
     _engine_instance = None
+
+
+def _build_demo_bars(close: float = 545.0, atr: float = 1.45, count: int = 60) -> dict:
+    """
+    Generate synthetic OHLCV bars for all timeframes (demo mode).
+    Uses sine-wave + linear trend so structure engine finds HH/HL swings.
+    """
+    import math
+    from datetime import timedelta
+
+    def _make_bars(base_close, base_atr, n, interval_minutes):
+        bars = []
+        now = datetime.now(tz=timezone.utc)
+        for i in range(n):
+            trend = (i - n // 2) * base_atr * 0.05
+            wave = math.sin(i * 0.45) * base_atr * 1.1
+            mid = base_close + trend + wave
+            h = round(mid + base_atr * 0.55, 2)
+            lo = round(mid - base_atr * 0.55, 2)
+            bars.append({
+                "timestamp": now - timedelta(minutes=(n - i) * interval_minutes),
+                "open": round(mid - base_atr * 0.08, 2),
+                "high": h,
+                "low": lo,
+                "close": round(mid + base_atr * 0.08, 2),
+                "volume": 500_000.0,
+                "vwap": round(mid, 2),
+            })
+        return bars
+
+    return {
+        "1d": _make_bars(close, atr * 8, 30, 1440),
+        "1h": _make_bars(close, atr * 3, 40, 60),
+        "15m": _make_bars(close, atr * 1.5, 50, 15),
+        "5m": _make_bars(close, atr, count, 5),
+        "1m": _make_bars(close, atr * 0.4, 60, 1),
+    }
 
 
 # ──────────────────────────────────────────────

@@ -111,6 +111,9 @@ class RuntimeState:
     # Trade tracking
     active_trade: Any = None   # engine.models.TradeState | None
 
+    # Market Structure Engine v2.0A — set by update_cycle each tick
+    structure_state: Any = None  # engine.structure_engine.StructureState
+
     # Warnings (refreshed each update cycle)
     active_warnings:      List[Any]      = field(default_factory=list)
     max_warning_severity: Optional[str]  = None

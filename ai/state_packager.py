@@ -45,6 +45,7 @@ class StatePackage:
     """
     assembled_at:    str = ""
     market:          Optional[Dict] = None
+    structure:       Optional[Dict] = None  # StructureState.to_dict()
     setup:           Optional[Dict] = None
     context:         Optional[Dict] = None
     trade:           Optional[Dict] = None
@@ -57,8 +58,8 @@ class StatePackage:
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"assembled_at": self.assembled_at,
                               "request_type": self.request_type}
-        for key in ("market", "setup", "context", "trade",
-                    "session", "patterns", "warnings"):
+        for key in ("market", "structure", "setup", "context", "trade",
+            "session", "patterns", "warnings"):
             val = getattr(self, key)
             if val:
                 d[key] = val
@@ -387,6 +388,21 @@ def package_warnings(warnings: List) -> Dict:
     }
 
 
+
+# ──────────────────────────────────────────────
+# Structure packager
+# ──────────────────────────────────────────────
+
+def package_structure(structure_state) -> Optional[Dict]:
+    """Serialise a StructureState into a compact dict for AI context."""
+    if structure_state is None:
+        return None
+    try:
+        return structure_state.to_dict()
+    except Exception:
+        return None
+
+
 # ──────────────────────────────────────────────
 # Full package builder
 # ──────────────────────────────────────────────
@@ -400,6 +416,7 @@ def build_full_package(
     session_memory  = None,
     pattern_memory  = None,
     warnings        = None,
+    structure_state = None,  # engine.structure_engine.StructureState
     request_type:    str = "analysis",
 ) -> StatePackage:
     """
@@ -449,6 +466,7 @@ def build_full_package(
     return StatePackage(
         assembled_at = now,
         market       = package_market_state(state)     if state          else None,
+        structure    = package_structure(structure_state),
         setup        = package_setup(score, direction)  if score          else None,
         context      = package_context(context_state)   if context_state  else None,
         trade        = package_trade(active_trade)      if active_trade   else None,

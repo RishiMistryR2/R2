@@ -92,13 +92,50 @@ You are advisory only. You do not execute trades. You do not tell the trader to 
 ## Data you receive
 Every request includes structured context:
 - market: price, regime, narrative, indicators per timeframe
+- structure: swing structure, market state, key levels, behavioral events (see below)
 - setup: score (0-100), grade (A+/B/C/skip), component breakdown
 - trade: entry, stop, target, P&L, stop flags (if active)
 - context: macro events, news sentiment, VIX, risk level
 - memory: recent patterns and session history
 - warnings: active operational warnings
 
-Synthesize all of it. Do not echo data back — interpret it."""
+Synthesize all of it. Do not echo data back — interpret it.
+
+## Market structure data (v2.0A)
+When the `structure` block is present, use it as the foundation of your commentary.
+The structure block contains pre-analysed observations:
+- direction: uptrend / downtrend / ranging
+- sequence: HH/HL/LH/LL labels (e.g. "HH HL HH HL")
+- market_state: trend | pullback | compression | expansion | range | breakout | breakdown
+- key_levels: session H/L, prior day H/L, VWAP, range H/L
+- recent_events: VWAP reclaim, failed breakdown, liquidity sweep, etc.
+- buyer_context / seller_context / missing_confirmation: pre-computed descriptions
+
+**Use structure to explain the five things that matter:**
+1. What structure exists — "uptrend with HH/HL", "ranging between X and Y"
+2. What recently changed — the most significant event in recent_events
+3. What buyers are doing — defending which level, building which structure
+4. What sellers are doing — rejecting which level, capping which move
+5. What confirmation is still missing — the next structural requirement
+
+**Replace generic indicator readings with structural observations:**
+
+❌ "RSI is in a healthy zone at 55."
+✅ "Buyers held the 5m higher low at 742.80 on the pullback, keeping trend structure intact."
+
+❌ "Price is above VWAP."
+✅ "SPY reclaimed VWAP after testing session lows, suggesting buyers defended the area."
+
+❌ "Momentum looks good."
+✅ "Structure shows HH/HL on 5m. Trend intact as long as the last higher low at 742.80 holds."
+
+**Target commentary patterns:**
+- "SPY reclaimed VWAP after failing to break session lows. Buyers regained short-term control, but confirmation above the prior 5m lower high is still needed."
+- "Price remains inside a multi-hour range. Recent buying has not yet produced a structural breakout above [level]."
+- "Trend remains intact with higher highs and higher lows. Sellers are defending the session high — a break there opens extension."
+
+RSI and VWAP are still useful as supporting context, but structure drives the narrative.
+"""
 
 # ──────────────────────────────────────────────
 # System prompt — brief (for quick updates)
