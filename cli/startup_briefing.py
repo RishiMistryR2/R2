@@ -1,20 +1,18 @@
 """
-cli/startup_briefing.py — pre-market briefing renderer for R2.
+cli/startup_briefing.py — session-aware startup briefing renderer for R2.
 
-Consumes:
-  - StartupBriefing   (memory.startup_context)
-  - SessionMemory     (memory.session_memory)
-  - PatternMemory     (memory.pattern_memory)
-  - MarketState       (engine.models)
+The header title reflects the actual market session at startup time:
+  PREMARKET   → R2 PRE-MARKET BRIEFING
+  OPEN        → R2 MARKET OPEN BRIEFING
+  MIDDAY      → R2 MIDDAY BRIEFING
+  POWER_HOUR  → R2 POWER HOUR BRIEFING
+  AFTER_HOURS → R2 AFTER-HOURS BRIEFING
+  CLOSED      → R2 CLOSED BRIEFING
+
+The session is read from state.market_session (a MarketSession enum set by
+update_cycle / build_live_state).  Falls back to the legacy pre-market title when absent.
 
 Pure formatting functions.  No I/O.
-
-The briefing is designed to orient the trader at session start:
-  - What happened yesterday
-  - What patterns are active
-  - What risks to watch today
-  - What the market looks like right now
-Concise.  No padding.  Every line earns its place.
 """
 
 from __future__ import annotations
@@ -25,6 +23,52 @@ from typing import List, Optional
 
 WIDTH = 72
 
+# Session title map — keyed on MarketSession.value strings
+_SESSION_TITLES = {
+    "premarket":   "R2 PRE-MARKET BRIEFING",
+    "open":        "R2 MARKET OPEN BRIEFING",
+    "midday":      "R2 MIDDAY BRIEFING",
+    "power_hour":  "R2 POWER HOUR BRIEFING",
+    "after_hours": "R2 AFTER-HOURS BRIEFING",
+    "closed":      "R2 CLOSED BRIEFING",
+}
+
+# Per-session "watch for" line used in AI prompt
+_SESSION_WATCH = {
+    "premarket":   "what to watch for at the open",
+    "open":        "how the open is developing",
+    "midday":      "how the midday session is developing",
+    "power_hour":  "what to expect in the power hour",
+    "after_hours": "how after-hours price action is developing",
+    "closed":      "what to watch for next session",
+}
+
+
+def session_briefing_title(market_session=None) -> str:
+    """
+    Return the correct briefing title for the given MarketSession.
+    Accepts a MarketSession enum, its .value string, or None.
+    """
+    if market_session is None:
+        return "R2 PRE-MARKET BRIEFING"
+    # Accept both enum and plain string
+    try:
+        key = market_session.value
+    except AttributeError:
+        key = str(market_session)
+    return _SESSION_TITLES.get(key, "R2 PRE-MARKET BRIEFING")
+
+
+def session_watch_phrase(market_session=None) -> str:
+    """Short 'what to watch' phrase for the given session."""
+    if market_session is None:
+        return "what to watch for in the current session"
+    try:
+        key = market_session.value
+    except AttributeError:
+        key = str(market_session)
+    return _SESSION_WATCH.get(key, "what to watch for in the current session")
+
 
 def render_startup_briefing(
     briefing,
@@ -32,22 +76,26 @@ def render_startup_briefing(
     context_state = None,
 ) -> str:
     """
-    Render the full pre-market briefing to a string.
+    Render the full session-aware startup briefing to a string.
 
     Parameters
     ----------
     briefing      : StartupBriefing
-    state         : MarketState | None  (current market snapshot if available)
+    state         : MarketState | None  — reads market_session from here for title
     context_state : ContextState | None
     """
     sections: List[str] = []
-    sections.append(_header(briefing))
+
+    # Pull market_session from the MarketState if available
+    market_session = getattr(state, "market_session", None) if state else None
+
+    sections.append(_header(briefing, market_session))
     sections.append(_previous_session(briefing))
     sections.append(_recent_performance(briefing))
     sections.append(_top_risks(briefing))
     sections.append(_active_patterns(briefing))
     if state is not None:
-        sections.append(_current_market(state, context_state))
+        sections.append(_current_market(state, context_state, market_session))
     sections.append(_footer(briefing))
 
     return "\n".join(s for s in sections if s)
@@ -57,15 +105,23 @@ def render_startup_briefing(
 # Section builders
 # ──────────────────────────────────────────────
 
-def _header(briefing) -> str:
+def _header(briefing, market_session=None) -> str:
     today  = briefing.session_date
     gen_at = briefing.generated_at[:19].replace("T", " ")
     symbol = "SPY"
+    title  = session_briefing_title(market_session)
     lines  = [
-        _divider("R2 PRE-MARKET BRIEFING"),
+        _divider(title),
         f"  Date     : {today}   Symbol : {symbol}",
         f"  Prepared : {gen_at} UTC",
     ]
+    # Show session label if it differs from the default "pre-market" assumption
+    if market_session is not None:
+        try:
+            sess_label = market_session.value.replace("_", " ").upper()
+        except AttributeError:
+            sess_label = str(market_session).upper()
+        lines.append(f"  Session  : {sess_label}")
     return "\n".join(lines)
 
 
@@ -132,9 +188,9 @@ def _active_patterns(briefing) -> str:
     if market:
         lines.append("  Market patterns:")
         for p in market[:3]:
-            pid = p.get("pattern_id", p.get("description", "—"))
-            wr  = p.get("win_rate", 0.0)
-            occ = p.get("occurrence_count", p.get("occurrences", 0))
+            pid  = p.get("pattern_id", p.get("description", "—"))
+            wr   = p.get("win_rate", 0.0)
+            occ  = p.get("occurrence_count", p.get("occurrences", 0))
             lines.append(f"    · {pid}  (wr {wr:.0%}, n={occ})")
 
     if behavior:
@@ -154,19 +210,39 @@ def _active_patterns(briefing) -> str:
     return "\n".join(lines)
 
 
-def _current_market(state, context_state) -> str:
+def _current_market(state, context_state, market_session=None) -> str:
     lines = [_section("CURRENT MARKET")]
 
-    ind_5m = state.indicators.get("5m") if state.indicators else None
-    if ind_5m and ind_5m.close:
-        price = ind_5m.close
-        vwap  = ind_5m.vwap
+    # Session label
+    if market_session is not None:
+        try:
+            sess = market_session.value.replace("_", " ").upper()
+        except AttributeError:
+            sess = str(market_session).upper()
+        lines.append(f"  Session: {sess}")
+
+    # Current price — prefer current_price (trade/quote) over bar close
+    current_price  = getattr(state, "current_price",        None)
+    price_source   = getattr(state, "current_price_source", None)
+    bid            = getattr(state, "bid",                  None)
+    ask            = getattr(state, "ask",                  None)
+    ind_5m         = state.indicators.get("5m") if state.indicators else None
+
+    if current_price is not None:
+        source_tag = f"  [{price_source}]" if price_source else ""
+        lines.append(f"  Price : {current_price:.2f}{source_tag}")
+        if bid is not None and ask is not None:
+            lines.append(f"  Bid/Ask: {bid:.2f} / {ask:.2f}  spread {ask - bid:.4g}")
+    elif ind_5m and ind_5m.close:
+        vwap = ind_5m.vwap
         if vwap:
-            diff = price - vwap
+            diff = ind_5m.close - vwap
             rel  = "above" if diff > 0 else "below"
-            lines.append(f"  Price : {price:.2f}  ·  VWAP {vwap:.2f} ({rel} by {abs(diff):.2f})")
+            lines.append(
+                f"  Price : {ind_5m.close:.2f}  ·  VWAP {vwap:.2f} ({rel} by {abs(diff):.2f})"
+            )
         else:
-            lines.append(f"  Price : {price:.2f}")
+            lines.append(f"  Price : {ind_5m.close:.2f}")
 
     if state.regime:
         regime = state.regime.regime.value.replace("_", " ").title()
@@ -222,9 +298,9 @@ def render_briefing_summary_line(briefing) -> str:
     """One-line summary for embedding in the dashboard header."""
     if not briefing.prev_session_date:
         return "No prior session"
-    wr   = briefing.prev_session_win_rate * 100
-    pnl  = briefing.prev_session_pnl_pct
-    sign = "+" if pnl >= 0 else ""
+    wr    = briefing.prev_session_win_rate * 100
+    pnl   = briefing.prev_session_pnl_pct
+    sign  = "+" if pnl >= 0 else ""
     risks = len(briefing.top_risks)
     return (
         f"Prev: {briefing.prev_session_date}  "

@@ -86,6 +86,13 @@ def package_market_state(state) -> Dict:
     result["symbol"]    = getattr(state, "symbol", "SPY")
     result["timestamp"] = _iso(getattr(state, "timestamp", None))
 
+    # Authoritative market session (premarket/open/midday/power_hour/after_hours/closed).
+    # This is more precise than the lossy SessionState.phase mapping.
+    market_session = getattr(state, "market_session", None)
+    if market_session is not None:
+        market_session = getattr(market_session, "value", str(market_session))
+    result["market_session"] = market_session
+
     # HTF bias
     htf = getattr(state, "htf_bias", None)
     if htf:
