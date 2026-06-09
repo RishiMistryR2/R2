@@ -183,7 +183,13 @@ def _try_startup_commentary(state: RuntimeState) -> None:
     try:
         text = generate_startup_briefing_commentary(state)
         if text:
-            print(f"\n  ── R2 Pre-market Briefing ──\n  {text[:500]}\n", flush=True)
+            try:
+                from cli.startup_briefing import session_briefing_title
+                ms = getattr(getattr(state, "market_state", None), "market_session", None)
+                title = session_briefing_title(ms)
+            except Exception:
+                title = "R2 PRE-MARKET BRIEFING"
+            print(f"\n  ── {title} ──\n  {text[:500]}\n", flush=True)
     except Exception as e:
         logger.info(f"[loop] Startup commentary skipped: {e}")
 

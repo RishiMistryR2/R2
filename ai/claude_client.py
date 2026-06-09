@@ -10,15 +10,19 @@ Features:
   - Session history management
   - ParsedResponse always returned (never raw dicts)
 
-Public sync functions (Phase 8 integration API):
-  generate_startup_commentary(package)    → ParsedResponse
-  generate_market_commentary(package)     → ParsedResponse
-  generate_setup_explanation(package)     → ParsedResponse
-  generate_trade_review(package)          → ParsedResponse
-  answer_user_question(package, q)        → ParsedResponse
-  generate_end_of_day_reflection(package) → ParsedResponse
+Mock mode design:
+  _generate_mock_response(request_type, package) reads the actual package
+  (session, regime, structure) to generate contextually accurate responses.
+  It NEVER uses hardcoded session labels, regime names, or indicator readings.
+  This ensures mock/test output matches what the live AI would be told to say.
 
-For async streaming use ClaudeClient directly.
+Public sync functions (Phase 8 integration API):
+  generate_startup_commentary(package)    -> ParsedResponse
+  generate_market_commentary(package)     -> ParsedResponse
+  generate_setup_explanation(package)     -> ParsedResponse
+  generate_trade_review(package)          -> ParsedResponse
+  answer_user_question(package, q)        -> ParsedResponse
+  generate_end_of_day_reflection(package) -> ParsedResponse
 """
 
 from __future__ import annotations
@@ -56,50 +60,149 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
+
 # ──────────────────────────────────────────────
-# Mock responses (used in test / mock mode)
+# Dynamic mock response generator
 # ──────────────────────────────────────────────
 
-_MOCK_RESPONSES: Dict[str, str] = {
-    "startup_briefing": (
-        "Pre-market: SPY is in a trend-bull regime with moderate confidence. "
-        "No elevated macro risk detected. "
-        "The structure favors continuation setups on pullbacks to VWAP. "
-        "Watch for a clean 5m setup in the first 30 minutes."
+# Human-readable labels for each market_session value
+_SESSION_LABELS: Dict[str, str] = {
+    "premarket":   "Pre-market",
+    "open":        "Market open",
+    "midday":      "Midday",
+    "power_hour":  "Power hour",
+    "after_hours": "After-hours",
+    "closed":      "Market closed",
+}
+
+# Session-appropriate closing lines — never mention "first 30 minutes" outside open
+_SESSION_CLOSINGS: Dict[str, str] = {
+    "premarket":   "Watch for a clear structural setup at the open.",
+    "open":        "Early structure is developing — watch for HH/HL confirmation.",
+    "midday":      "Midday liquidity may be lower — structure quality matters.",
+    "power_hour":  "Power hour can extend or reverse moves — watch key levels closely.",
+    "after_hours": (
+        "Extended-hours volume is lower. "
+        "Levels here are directional signals for next session, not active entry triggers."
     ),
-    "market_commentary": (
-        "Current narrative is trending-bull with aligned timeframes. "
-        "Price is holding above VWAP; RSI is in a healthy zone. "
-        "Regime confidence is adequate for selective entries."
-    ),
-    "setup_explanation": (
-        "This is a B-grade setup. Trend alignment is solid across 1h and 15m, "
-        "but entry timing is marginal — the 5m candle has not yet confirmed the "
-        "pullback completion. Stop sits below the 15m swing low. "
-        "R:R is acceptable at 1.5. Main risk: context bias is neutral, not aligned. "
-        "Worth monitoring for a cleaner entry candle."
-    ),
-    "trade_review": (
-        "Trade thesis is intact. Price is holding above the entry level and "
-        "stop has not been approached. Time stop window has not elapsed. "
-        "Monitor the 15m structure for any deterioration."
-    ),
-    "end_of_day": (
-        "Session shows adequate execution quality. "
-        "Win rate and expectancy are within historical norms. "
-        "Key lesson: continue waiting for A-grade setups rather than forcing B setups "
-        "in choppy conditions."
-    ),
-    "user_answer": (
-        "Based on the current data: the structure suggests the setup remains valid. "
-        "The thesis is intact as long as price holds above the indicated support level."
-    ),
+    "closed":      "Market is closed. Review structure for next-session preparation.",
 }
 
 
-# ──────────────────────────────────────────────
+def _generate_mock_response(request_type: str, package: StatePackage) -> str:
+    """
+    Generate a contextually accurate mock response from the actual package data.
+
+    Reads session, regime, and structure from the package so that mock mode
+    commentary reflects reality — never says 'pre-market' for after-hours,
+    never says 'trend-bull' when regime is chop, and never mentions
+    'first 30 minutes' outside the open session.
+    """
+    d = package.to_dict()
+
+    market    = d.get("market", {}) or {}
+    struct    = d.get("structure", {}) or {}
+    setup_d   = d.get("setup", {}) or {}
+    trade_d   = d.get("trade", {}) or {}
+
+    # ── Session ──────────────────────────────────────────────
+    ms_key     = market.get("market_session", "")
+    sess_label = _SESSION_LABELS.get(ms_key, "Current session")
+    closing    = _SESSION_CLOSINGS.get(ms_key, "Monitor structure for directional signals.")
+
+    # ── Regime / narrative ───────────────────────────────────
+    regime    = market.get("regime", {}).get("name", "unknown").replace("_", " ")
+    narrative = market.get("narrative", {}).get("condition", "").replace("_", " ")
+
+    # ── Structure ────────────────────────────────────────────
+    direction = struct.get("direction", "")
+    seq       = struct.get("sequence", "")
+    mkt_state = struct.get("market_state", "")
+    buyer     = struct.get("buyer_context", "")
+    seller    = struct.get("seller_context", "")
+    missing   = struct.get("missing_confirmation", "")
+
+    # ── Build by request type ────────────────────────────────
+
+    if request_type == "startup_briefing":
+        parts = [f"{sess_label}: SPY is in a {regime} regime."]
+        if direction and seq:
+            parts.append(f"Structure shows {direction} ({seq} on 5m).")
+        if mkt_state:
+            parts.append(f"Market state: {mkt_state}.")
+        if buyer:
+            parts.append(buyer)
+        if seller:
+            parts.append(seller)
+        if missing:
+            parts.append(missing)
+        parts.append(closing)
+        return " ".join(parts)
+
+    if request_type == "market_commentary":
+        parts = []
+        if direction and seq:
+            parts.append(f"Structure shows {direction} ({seq} on 5m).")
+        if mkt_state:
+            parts.append(f"Market state: {mkt_state}.")
+        if buyer:
+            parts.append(buyer)
+        if seller:
+            parts.append(seller)
+        if missing:
+            parts.append(missing)
+        if not parts:
+            # Minimal fallback if no structure — use regime + narrative
+            parts.append(f"Regime is {regime}.")
+            if narrative:
+                parts.append(f"Narrative: {narrative}.")
+        return " ".join(parts)
+
+    if request_type == "setup_explanation":
+        score = setup_d.get("adjusted_total") or setup_d.get("total") or 0
+        grade = setup_d.get("grade", "B")
+        parts = [f"This is a {grade}-grade setup (score: {score:.0f}/100)."]
+        if direction and seq:
+            parts.append(f"Structure shows {direction} ({seq}).")
+        else:
+            parts.append(f"Regime is {regime}.")
+        if missing:
+            parts.append(f"Confirmation needed: {missing}")
+        return " ".join(parts)
+
+    if request_type == "trade_review":
+        thesis_ok = not (
+            trade_d.get("thesis_stop_triggered") or
+            trade_d.get("time_stop_triggered") or
+            trade_d.get("premium_stop_triggered")
+        )
+        if not thesis_ok:
+            return "Stop flag is active. Review the trade against current structure."
+        return (
+            "Trade thesis is intact per current structure. "
+            "Stop level has not been approached. "
+            "Monitor key structural supports for any deterioration."
+        )
+
+    if request_type == "end_of_day":
+        return (
+            "Session complete. Review execution quality versus process compliance. "
+            "Key lesson: wait for structural confirmation — regime and session "
+            "context should align before entry."
+        )
+
+    # user_question / user_answer / fallback
+    return (
+        f"Based on current data: {sess_label.lower()} session. "
+        f"Regime is {regime}. "
+        + (f"Structure shows {direction} ({seq})." if direction and seq else "")
+        + " The thesis is intact as long as key structural levels hold."
+    )
+
+
+# ══════════════════════════════════════════════════════════════
 # Async ClaudeClient
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
 
 class ClaudeClient:
     """
@@ -111,6 +214,8 @@ class ClaudeClient:
 
     Mock mode (for tests — no network):
         client = ClaudeClient(mock=True)
+        # Responses are generated dynamically from the package context,
+        # not from hardcoded strings.
     """
 
     def __init__(
@@ -120,34 +225,38 @@ class ClaudeClient:
         timeout:  float         = 30.0,
     ) -> None:
         self._mock    = mock
-        self._timeout = timeout
         self._history: List[Dict] = []
-        self._client  = None
 
         if mock:
             logger.info("[R2-AI] Mock mode enabled — no API calls will be made")
+            self._client = None
             return
 
         key = api_key or ANTHROPIC_API_KEY
-        if HAS_ANTHROPIC and key:
-            self._client = anthropic.AsyncAnthropic(api_key=key, timeout=timeout)
-        elif not HAS_ANTHROPIC:
+        if not key:
+            logger.warning("[R2-AI] No ANTHROPIC_API_KEY — AI unavailable")
+            self._client = None
+            return
+
+        if not HAS_ANTHROPIC:
             logger.warning("[R2-AI] anthropic package not installed — AI unavailable")
-        else:
-            logger.warning("[R2-AI] ANTHROPIC_API_KEY not set — AI unavailable")
+            self._client = None
+            return
+
+        try:
+            self._client = anthropic.AsyncAnthropic(api_key=key, timeout=timeout)
+        except Exception as e:
+            logger.error(f"[R2-AI] Client init failed: {e}")
+            self._client = None
 
     @property
     def is_available(self) -> bool:
         return self._mock or (self._client is not None)
 
-    # ──────────────────────────────────────────
-    # Phase 8 package-based API
-    # ──────────────────────────────────────────
-
     async def ask_with_package(
         self,
         package:       StatePackage,
-        request_type:  str           = "market_commentary",
+        request_type:  str,
         user_question: Optional[str] = None,
         direction:     Optional[str] = None,
         warning_msg:   Optional[str] = None,
@@ -163,15 +272,7 @@ class ClaudeClient:
             )
 
         if self._mock:
-            key = {
-                "startup_briefing":  "startup_briefing",
-                "market_commentary": "market_commentary",
-                "setup_explanation": "setup_explanation",
-                "trade_review":      "trade_review",
-                "end_of_day":        "end_of_day",
-                "user_question":     "user_answer",
-            }.get(request_type, "market_commentary")
-            raw = _MOCK_RESPONSES[key]
+            raw = _generate_mock_response(request_type, package)
             return parse_response(raw, request_type, package.risk_flags)
 
         system, user = self._build_prompt(
@@ -209,22 +310,19 @@ class ClaudeClient:
             return
 
         if self._mock:
-            yield _MOCK_RESPONSES.get("user_answer", "Analysis unavailable.")
+            yield _generate_mock_response(request_type, package)
             return
 
         system, user = self._build_prompt(
-            package, request_type, user_question=question
+            package, "user_question", user_question=question
         )
-        messages = self._history[-(AI_HISTORY_MAX_TURNS * 2):] + [
-            {"role": "user", "content": user}
-        ]
-
-        full_reply: List[str] = []
+        messages = self._history[-4:] + [{"role": "user", "content": user}]
         try:
             async with self._client.messages.stream(
                 model=CLAUDE_MODEL, max_tokens=CLAUDE_MAX_TOKENS,
                 system=system, messages=messages,
             ) as stream:
+                full_reply = []
                 async for text in stream.text_stream:
                     full_reply.append(text)
                     yield text
@@ -240,7 +338,8 @@ class ClaudeClient:
     async def ask(self, question: str, context, brief: bool = False) -> str:
         """Legacy single-string ask.  Preserved for Phase 1 compatibility."""
         if self._mock:
-            return _MOCK_RESPONSES["user_answer"]
+            return _generate_mock_response("user_answer",
+                                           _make_minimal_package(question))
         if not self._client:
             return "[AI unavailable — check ANTHROPIC_API_KEY]"
         context.user_question = question
@@ -265,7 +364,8 @@ class ClaudeClient:
     async def proactive_commentary(self, context) -> str:
         """Legacy proactive update.  Preserved for compatibility."""
         if self._mock:
-            return _MOCK_RESPONSES["market_commentary"]
+            return _generate_mock_response("market_commentary",
+                                           _make_minimal_package())
         if not self._client:
             return ""
         context.request_type = "update"
@@ -348,6 +448,16 @@ class ClaudeClient:
 
 
 # ──────────────────────────────────────────────
+# Minimal package factory (for legacy paths)
+# ──────────────────────────────────────────────
+
+def _make_minimal_package(question: str = "") -> StatePackage:
+    """Create a bare StatePackage for legacy code paths that don't have one."""
+    from ai.state_packager import StatePackage
+    return StatePackage(request_type="user_question" if question else "market_commentary")
+
+
+# ──────────────────────────────────────────────
 # Synchronous integration API (Phase 8 public)
 # ──────────────────────────────────────────────
 
@@ -372,7 +482,7 @@ def _client(mock: bool = False) -> ClaudeClient:
 def generate_startup_commentary(
     package: StatePackage, mock: bool = False
 ) -> ParsedResponse:
-    """Pre-market orientation."""
+    """Session-aware startup orientation."""
     return _run_async(_client(mock).ask_with_package(package, "startup_briefing"))
 
 
