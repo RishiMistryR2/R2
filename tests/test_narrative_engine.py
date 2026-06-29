@@ -447,6 +447,181 @@ def test_from_package_no_structure_key():
                                                      "regime": {"name": "chop"}}})
     assert "chop" in text.lower() or "after hours" in text.lower()
 
+# ──────────────────────────────────────────────────────────────
+# v2.1 — Level specificity and invalidation
+# ──────────────────────────────────────────────────────────────
+
+def test_range_buyer_seller_uses_session_levels():
+    """Range branch must use actual session_high/session_low values."""
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(_range_dict(), session="open", entries_allowed=True)
+    # session_high=549.48, session_low=541.19 must appear
+    assert "549.48" in text, f"session_high missing from range narrative:\n{text}"
+    assert "541.19" in text, f"session_low missing from range narrative:\n{text}"
+
+
+def test_range_no_generic_equilibrium():
+    """Range branch must not say 'buyers and sellers are in equilibrium' without levels."""
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(_range_dict(), session="open", entries_allowed=True)
+    # The generic equilibrium phrase only appears when levels are absent
+    if "equilibrium" in text.lower():
+        # If it's there, levels must also be there to anchor it
+        assert "541.19" in text or "549.48" in text, (
+            f"'equilibrium' used without level anchors:\n{text}"
+        )
+
+
+def test_uptrend_has_invalidation():
+    """Uptrend narrative must include invalidation (close below HL or session low)."""
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(_uptrend_dict(), session="open", entries_allowed=True)
+    lower = text.lower()
+    assert (
+        "structure degrades" in lower
+        or "degrades" in lower
+        or "close below" in lower
+        or "invalidat" in lower
+    ), f"Expected invalidation in uptrend narrative:\n{text}"
+
+
+def test_downtrend_has_invalidation():
+    """Downtrend narrative must include invalidation (reclaim of LH or session high)."""
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(_downtrend_dict(), session="open", entries_allowed=True)
+    lower = text.lower()
+    assert (
+        "reclaim" in lower
+        or "loses conviction" in lower
+        or "invalidat" in lower
+        or "close above" in lower
+    ), f"Expected invalidation in downtrend narrative:\n{text}"
+
+
+def test_range_has_confirmation_with_level():
+    """Range narrative must state confirmation level explicitly."""
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(_range_dict(), session="open", entries_allowed=True)
+    # Either from _confirmation or _invalidation
+    assert "549.48" in text or "541.19" in text, (
+        f"Range narrative missing specific confirmation level:\n{text}"
+    )
+
+
+def test_range_has_invalidation_both_directions():
+    """Range invalidation must give both bullish and bearish resolution levels."""
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(_range_dict(), session="open", entries_allowed=True)
+    # Both session_high and session_low should appear
+    has_high = "549.48" in text
+    has_low  = "541.19" in text
+    assert has_high and has_low, (
+        f"Range narrative should reference both session_high (549.48) "
+        f"and session_low (541.19):\n{text}"
+    )
+
+
+def test_minimal_fallback_chop_uses_session_levels():
+    """
+    No-structure chop fallback must use specific price levels, not just
+    'current range'.
+    """
+    from engine.narrative_engine import build_narrative
+    kl = {
+        "session_high":   737.00,
+        "session_low":    735.80,
+        "vwap":           736.40,
+        "prior_day_high": 738.50,
+        "prior_day_low":  734.20,
+        "nearest_support": None,
+        "nearest_resistance": None,
+    }
+    # Pass kl via a minimal struct dict with no direction
+    struct_no_dir = {"key_levels": kl, "direction": "", "market_state": "range"}
+    text = build_narrative(struct_no_dir, regime="chop", session="after_hours",
+                           entries_allowed=False)
+    assert "737.00" in text or "735.80" in text, (
+        f"Fallback chop must reference specific levels:\n{text}"
+    )
+    assert "current range" not in text.lower(), (
+        f"'current range' without levels is too generic:\n{text}"
+    )
+
+
+def test_minimal_fallback_no_generic_range_phrase():
+    """'current range' must not appear as an unanchored phrase."""
+    from engine.narrative_engine import build_narrative
+    # No structure, no levels at all — generic is acceptable here
+    text = build_narrative(None, regime="chop", session="after_hours",
+                           entries_allowed=False)
+    # This path has no levels — but should still not say "current range"
+    assert "current range" not in text.lower(), (
+        f"'current range' should not appear without a specific level:\n{text}"
+    )
+
+
+def test_minimal_fallback_trend_bull_mentions_specific_level():
+    """Trend bull fallback with levels must mention a specific breakout target."""
+    from engine.narrative_engine import build_narrative
+    kl = {
+        "session_high":   549.48,
+        "session_low":    541.19,
+        "vwap":           543.50,
+        "prior_day_high": 565.43,
+        "prior_day_low":  552.67,
+        "nearest_support": None,
+        "nearest_resistance": None,
+    }
+    struct_no_dir = {"key_levels": kl, "direction": "", "market_state": "range"}
+    text = build_narrative(struct_no_dir, regime="trend_bull", session="open",
+                           entries_allowed=True)
+    # Should mention some breakout level
+    import re
+    prices = re.findall(r"\d{3,}\.\d{2}", text)
+    assert len(prices) >= 1, f"Trend bull fallback with levels must mention a price:\n{text}"
+
+
+def test_uptrend_confirmation_and_invalidation_have_different_levels():
+    """Confirmation and invalidation must reference different price levels."""
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(_uptrend_dict(), session="open", entries_allowed=True)
+    import re
+    prices = re.findall(r"\d{3,}\.\d{2}", text)
+    unique = set(prices)
+    assert len(unique) >= 2, (
+        f"Expected at least 2 distinct levels in uptrend narrative:\n{text}\n"
+        f"Prices found: {prices}"
+    )
+
+
+def test_structure_state_object_has_invalidation():
+    """StructureState object path must produce invalidation."""
+    from engine.narrative_engine import build_narrative
+    from engine.structure_engine import analyze
+    from runtime.update_cycle import build_demo_state, reset_engine
+    reset_engine()
+    struct = analyze(build_demo_state())
+    text   = build_narrative(struct, session="open", entries_allowed=True)
+    lower  = text.lower()
+    assert (
+        "degrades" in lower or "close below" in lower
+        or "reclaim" in lower or "loses conviction" in lower
+    ), f"StructureState path must produce invalidation:\n{text}"
+
+
+def test_vwap_mentioned_as_pivot_in_range():
+    """When VWAP is in key_levels, range output must call it a pivot."""
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(_range_dict(), session="open", entries_allowed=True)
+    lower = text.lower()
+    # _range_dict includes vwap=545.00
+    assert "545.00" in text or "vwap" in lower, (
+        f"Range narrative should reference VWAP:\n{text}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+
 
 # ──────────────────────────────────────────────────────────────
 # Runner

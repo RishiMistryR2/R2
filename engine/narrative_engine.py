@@ -91,14 +91,16 @@ def build_narrative(
     fields   = _to_fields(struct_or_dict)
 
     if not fields or not fields.get("direction"):
-        return _minimal_fallback(symbol, regime, sess_key, entries_allowed)
+        kl = fields.get("key_levels", {}) or {} if fields else {}
+        return _minimal_fallback(symbol, regime, sess_key, entries_allowed, kl=kl)
 
     try:
         return _full_narrative(
             fields, symbol, sess_key, regime, entries_allowed, current_price
         )
     except Exception:
-        return _minimal_fallback(symbol, regime, sess_key, entries_allowed)
+        kl = fields.get("key_levels", {}) or {}
+        return _minimal_fallback(symbol, regime, sess_key, entries_allowed, kl=kl)
 
 
 def build_narrative_from_package(package_dict: dict) -> str:
@@ -142,9 +144,13 @@ def _full_narrative(
     if lv:
         parts.append(lv)
 
-    cf = _confirmation(f)
+        cf = _confirmation(f)
     if cf:
         parts.append(cf)
+
+    iv = _invalidation(f)
+    if iv:
+        parts.append(iv)
 
     im = _implication(f, sess_key, entries_allowed, regime)
     if im:
@@ -284,16 +290,14 @@ def _buyer_seller(f: dict) -> str:
 
     if state in ("range", "compression") or direction in ("ranging", ""):
         if s_high and s_low:
+            buyer_str = f"Buyers continue defending {s_low:.2f} (session low)"
+            seller_str = f"sellers are rejecting moves above {s_high:.2f} (session high)"
             if vwap:
                 return (
-                    f"Buyers are defending near {s_low:.2f} while sellers "
-                    f"reject advances toward {s_high:.2f}; "
-                    f"VWAP ({vwap:.2f}) acts as the mid-range pivot."
+                    f"{buyer_str} while {seller_str}. "
+                    f"VWAP at {vwap:.2f} is the current equilibrium pivot."
                 )
-            return (
-                f"Buyers are defending near {s_low:.2f} while sellers "
-                f"continue to reject advances toward {s_high:.2f}."
-            )
+            return f"{buyer_str} while {seller_str}."
         return (
             "Neither buyers nor sellers have established follow-through "
             "beyond current boundaries."
@@ -366,6 +370,58 @@ def _confirmation(f: dict) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
+# Part 4b — Invalidation
+# ──────────────────────────────────────────────────────────────
+
+def _invalidation(f: dict) -> str:
+    """
+    State what price action would damage or invalidate the current thesis.
+    Anchored to actual structural levels — never generic.
+    """
+    direction = f.get("direction", "")
+    state     = f.get("market_state", "")
+    kl        = f.get("key_levels", {}) or {}
+    s_high    = kl.get("session_high")
+    s_low     = kl.get("session_low")
+    hl        = f.get("last_hl")
+    lh        = f.get("last_lh")
+
+    if direction == "uptrend":
+        anchor = hl or s_low
+        if anchor:
+            label = (
+                f"higher low ({anchor:.2f})" if hl
+                else f"session low ({anchor:.2f})"
+            )
+            return f"Structure degrades on a close below the {label}."
+
+    elif direction == "downtrend":
+        anchor = lh or s_high
+        if anchor:
+            label = (
+                f"lower high ({anchor:.2f})" if lh
+                else f"session high ({anchor:.2f})"
+            )
+            return f"Downtrend loses conviction on a reclaim of the {label}."
+
+    elif state in ("range", "compression") or direction in ("ranging", ""):
+        if s_high and s_low:
+            return (
+                f"A confirmed close above {s_high:.2f} resolves the range bullish; "
+                f"a close below {s_low:.2f} resolves bearish."
+            )
+
+    elif state == "breakout":
+        if s_high:
+            return f"Breakout fails if price closes back below {s_high:.2f}."
+
+    elif state == "breakdown":
+        if s_low:
+            return f"Breakdown invalidated on a reclaim of {s_low:.2f}."
+
+    return ""
+
+# ──────────────────────────────────────────────────────────────
 # Part 5 — Trading implication
 # ──────────────────────────────────────────────────────────────
 
@@ -424,48 +480,125 @@ def _implication(
 # ──────────────────────────────────────────────────────────────
 
 def _minimal_fallback(
-    symbol: str, regime: str, sess_key: str, entries_allowed: bool
+    symbol:          str,
+    regime:          str,
+    sess_key:        str,
+    entries_allowed: bool,
+    kl:              dict = None,
 ) -> str:
     """
-    Meaningful paragraph when structure_state is absent.
-    Always better than 'Regime is chop. Narrative: chop.'
+    Meaningful paragraph when structure has no directional sequence.
+    Uses key levels from the package to anchor every sentence to specific prices.
+    Falls back gracefully when levels are also absent.
     """
+    kl           = kl or {}
     regime_clean = (regime or "").replace("_", " ").strip()
     sess_pfx     = _SESS_PREFIX.get(sess_key, "")
     sess_suffix  = _SESS_CLOSING.get(sess_key, "")
 
+    # Extract available levels
+    s_high  = kl.get("session_high")
+    s_low   = kl.get("session_low")
+    vwap    = kl.get("vwap")
+    pdh     = kl.get("prior_day_high")
+    pdl     = kl.get("prior_day_low")
+
+    def _level_block() -> str:
+        """
+        Build buyer/seller/confirmation sentences anchored to actual levels.
+        Returns empty string when no levels are available.
+        """
+        if not s_high and not s_low:
+            return ""
+        parts: list[str] = []
+        if s_high and s_low:
+            parts.append(
+                f"Buyers are defending {s_low:.2f} (session low) while sellers "
+                f"are rejecting advances toward {s_high:.2f} (session high)."
+            )
+            if vwap:
+                parts.append(
+                    f"VWAP at {vwap:.2f} is the current equilibrium pivot."
+                )
+            parts.append(
+                f"Confirmation of a bullish break requires acceptance above "
+                f"{s_high:.2f}. A close below {s_low:.2f} signals bearish continuation."
+            )
+        elif s_high:
+            parts.append(
+                f"Resistance at the session high ({s_high:.2f}). "
+                f"A sustained break above that level would shift the bias."
+            )
+        elif s_low:
+            parts.append(
+                f"Support at the session low ({s_low:.2f}). "
+                f"Losing that level would increase downside risk."
+            )
+        if pdh and s_high and pdh > s_high:
+            parts.append(
+                f"Prior day high at {pdh:.2f} is overhead resistance beyond the session high."
+            )
+        return " ".join(parts)
+
+    def _trend_watch(bull: bool) -> str:
+        if bull:
+            watch = pdh if (pdh and s_high and pdh > s_high) else s_high
+            base  = "watch for higher highs and higher lows to form on 5m"
+            if watch:
+                return f"{base}. A break and hold above {watch:.2f} confirms directional strength."
+            return base + "."
+        else:
+            watch = pdl if (pdl and s_low and pdl < s_low) else s_low
+            base  = "watch for lower highs and lower lows to form on 5m"
+            if watch:
+                return f"{base}. A break and hold below {watch:.2f} confirms directional weakness."
+            return base + "."
+
+    lv = _level_block()
+
     if not regime_clean or regime_clean in ("unknown", ""):
-        body = (
-            f"{sess_pfx}{symbol} structure is still loading. "
-            "No directional edge is identifiable yet — "
-            "wait for a clear HH/HL or LH/LL sequence to develop."
+        base = (
+            f"{sess_pfx}{symbol} structure is still loading — "
+            "no directional sequence has formed yet."
         )
+        body = base + (" " + lv if lv else "")
+
     elif "chop" in regime_clean or "neutral" in regime_clean:
-        body = (
-            f"{sess_pfx}{symbol} is in a {regime_clean} regime — "
-            "no clean directional structure has formed. "
-            "Buyers and sellers are in equilibrium; "
-            "wait for a clear break of the current range before committing."
+        base = (
+            f"{sess_pfx}{symbol} is range-bound — "
+            "no clean directional structure has formed on 5m."
         )
+        body = (
+            base + " " + lv if lv
+            else base + (
+                " Buyers and sellers are in equilibrium; "
+                "wait for a clear break before committing."
+            )
+        )
+
     elif "bull" in regime_clean or "trend" in regime_clean:
-        body = (
+        base = (
             f"{sess_pfx}{symbol} is in a {regime_clean} regime. "
             "Structural confirmation is still loading — "
-            "watch for higher highs and higher lows to form on 5m "
-            "before entering with the trend."
+            + _trend_watch(bull=True)
         )
+        body = base + (" " + lv if lv else "")
+
     elif "bear" in regime_clean:
-        body = (
+        base = (
             f"{sess_pfx}{symbol} is in a {regime_clean} regime. "
             "Structural confirmation is still loading — "
-            "watch for lower highs and lower lows to form on 5m "
-            "before entering with the trend."
+            + _trend_watch(bull=False)
         )
+        body = base + (" " + lv if lv else "")
+
     else:
+        base = (
+            f"{sess_pfx}{symbol} is in a {regime_clean} regime."
+        )
         body = (
-            f"{sess_pfx}{symbol} is in a {regime_clean} regime. "
-            "No structural detail available yet — "
-            "monitor price action before entering."
+            base + " " + lv if lv
+            else base + " No structural detail available yet — monitor price action."
         )
 
     if sess_suffix:
@@ -473,7 +606,6 @@ def _minimal_fallback(
     if not entries_allowed:
         return body + " Entries not currently permitted."
     return body
-
 
 # ──────────────────────────────────────────────────────────────
 # Normalisation helpers

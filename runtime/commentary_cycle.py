@@ -34,6 +34,14 @@ except Exception:  # pragma: no cover - defensive fallback for degraded runtime 
 
 logger = logging.getLogger("runtime.commentary")
 
+# ── Event intelligence state (module-level) ─────────────────────
+# Avoids threading through RuntimeState. Single process — safe.
+_last_snapshot:      "object | None" = None      # MarketSnapshot | None
+_last_informational: "object | None" = None      # datetime | None
+
+# Minimum seconds between INFORMATIONAL-priority commentary.
+# CRITICAL and IMPORTANT events always bypass this limit.
+_MIN_INFORMATIONAL_GAP: float = 300.0  # 5 minutes
 
 # ──────────────────────────────────────────────
 # Trigger reasons
@@ -94,7 +102,51 @@ def generate_commentary(
             answer_user_question,
         )
 
-        # ── Debug: verify structure pipeline before packaging ──────────
+        # ── Event intelligence — runs BEFORE the package build ──────
+        # Suppresses insignificant events with zero API cost.
+        _current_snap = None
+        _event_result = None
+
+        if trigger not in ("startup_briefing", "user_request"):
+            try:
+                from engine.event_engine import build_snapshot, evaluate_event
+                global _last_snapshot, _last_informational
+
+                _current_snap = build_snapshot(state, trigger)
+                _event_result = evaluate_event(_current_snap, _last_snapshot, trigger)
+
+                if _event_result.suppress:
+                    logger.debug(
+                        f"[event] Suppressed [{trigger}]  "
+                        f"score={_event_result.score:.0f}  "
+                        f"priority={_event_result.priority}"
+                    )
+                    return None
+
+                # Rate-limit informational events
+                if (_event_result.priority == "informational"
+                        and _last_informational is not None):
+                    elapsed = (
+                        datetime.now(tz=timezone.utc) - _last_informational
+                    ).total_seconds()
+                    if elapsed < _MIN_INFORMATIONAL_GAP:
+                        logger.debug(
+                            f"[event] Informational rate-limited [{trigger}]  "
+                            f"elapsed={elapsed:.0f}s  gap={_MIN_INFORMATIONAL_GAP:.0f}s"
+                        )
+                        return None
+
+                logger.info(
+                    f"[event] Approved [{trigger}]  "
+                    f"priority={_event_result.priority}  "
+                    f"score={_event_result.score:.0f}"
+                    + (f"  — {_event_result.change_summary[:100]}"
+                       if _event_result.change_summary else "")
+                )
+            except Exception as _ee:
+                # Event intelligence is non-fatal — proceed to commentary
+                logger.warning(f"[event] Intelligence check error (non-fatal): {_ee}")
+
         _log_structure_debug(state, trigger)
 
         package = build_full_package(
@@ -150,6 +202,13 @@ def generate_commentary(
 
         text = result.text
         _commit_commentary(state, text, trigger)
+
+        # Advance event intelligence state only after successful commentary.
+        if _current_snap is not None:
+            _last_snapshot = _current_snap
+        if (_event_result is not None
+                and _event_result.priority == "informational"):
+            _last_informational = datetime.now(tz=timezone.utc)
 
         logger.info(
             f"[commentary] Generated [{trigger}]  "

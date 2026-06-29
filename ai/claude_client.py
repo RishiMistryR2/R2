@@ -124,9 +124,18 @@ def _generate_mock_response(request_type: str, package: StatePackage) -> str:
 
     # ── Build by request type ────────────────────────────────
 
-    if request_type in ("startup_briefing", "market_commentary"):
-        from engine.narrative_engine import build_narrative_from_package
-        return build_narrative_from_package(d)
+    if request_type == "startup_briefing":
+        from engine.confidence_engine import build_thesis_from_package
+        from engine.pattern_engine import build_pattern_narrative_from_package
+        thesis   = build_thesis_from_package(d)
+        patterns = build_pattern_narrative_from_package(d)
+        if patterns:
+            return f"{thesis}\n\n{patterns}"
+        return thesis
+
+    if request_type == "market_commentary":
+        from engine.confidence_engine import build_compact_thesis_from_package
+        return build_compact_thesis_from_package(d)
 
     if request_type == "setup_explanation":
         score = setup_d.get("adjusted_total") or setup_d.get("total") or 0
