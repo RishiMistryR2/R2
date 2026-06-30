@@ -210,6 +210,36 @@ def generate_commentary(
                 and _event_result.priority == "informational"):
             _last_informational = datetime.now(tz=timezone.utc)
 
+        # ── Outcome tracker: record observation on significant events ──
+        # _event_result and _current_snap are set by the v2.4 event
+        # intelligence block above this point.  On versions without those
+        # variables a NameError is caught safely.
+        try:
+            _er = _event_result   # noqa: F821  — defined in event intel block
+            _cs = _current_snap   # noqa: F821
+            if (_er is not None
+                    and _er.priority in ("critical", "important")
+                    and _cs is not None):
+                from memory.outcome_tracker  import get_tracker
+                from engine.pattern_engine   import classify_patterns
+                from engine.narrative_engine import _to_fields
+                _struct   = getattr(state, "structure_state", None)
+                _fields   = _to_fields(_struct) if _struct else {}
+                _patterns = classify_patterns(_fields)
+                if _patterns:
+                    _ms_obj  = getattr(
+                        getattr(state, "market_state", None),
+                        "market_session", None,
+                    )
+                    _session = _ms_obj.value if _ms_obj else ""
+                    get_tracker().record_observation(
+                        _cs, _patterns, session=_session,
+                    )
+        except Exception as _ot_err:
+            logger.debug(
+                f"[outcome] record_observation failed (non-fatal): {_ot_err}"
+            )
+
         logger.info(
             f"[commentary] Generated [{trigger}]  "
             f"conf={result.confidence_label}  "

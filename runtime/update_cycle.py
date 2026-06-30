@@ -67,6 +67,25 @@ def run_update_cycle(state: RuntimeState) -> bool:
         state.mark_update()
         state.health.record_success()
 
+        # ── Outcome tracker: resolve pending observations ───────────
+        # Runs after every successful update cycle.  Always non-fatal.
+        try:
+            from memory.outcome_tracker import get_tracker
+            _px  = getattr(state.market_state, "current_price", None)
+            _atr = None
+            if state.market_state:
+                _ind_map = getattr(state.market_state, "indicators", None) or {}
+                _ind_5m  = _ind_map.get("5m")
+                if _ind_5m:
+                    _atr = getattr(_ind_5m, "atr", None)
+            if _px is not None:
+                get_tracker().update_pending(
+                    float(_px),
+                    atr=float(_atr) if _atr is not None else None,
+                )
+        except Exception:
+            pass   # outcome tracker is always non-fatal
+
         logger.debug(
             f"[cycle #{state.update_count}]"
             f"  regime={_regime_label(market)}"

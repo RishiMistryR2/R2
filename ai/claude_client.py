@@ -126,12 +126,54 @@ def _generate_mock_response(request_type: str, package: StatePackage) -> str:
 
     if request_type == "startup_briefing":
         from engine.confidence_engine import build_thesis_from_package
-        from engine.pattern_engine import build_pattern_narrative_from_package
+        from engine.pattern_engine    import build_pattern_narrative_from_package
+        from memory.statistical_intelligence import (
+            get_historical_context_from_package,
+            calibrate_confidence,
+            summary_text,
+        )
         thesis   = build_thesis_from_package(d)
         patterns = build_pattern_narrative_from_package(d)
+
+        # ── Statistical intelligence: historical context block ─────
+        hist_block = ""
+        try:
+            ctx = get_historical_context_from_package(d)
+            if ctx.has_sufficient_history:
+                # Re-derive base confidence from package for calibration
+                base_conf = 50.0
+                try:
+                    from engine.confidence_engine import compute_confidence
+                    from engine.narrative_engine  import _to_fields
+                    struct  = d.get("structure", {}) or {}
+                    fields  = _to_fields(struct)
+                    market  = d.get("market", {}) or {}
+                    reg_d   = market.get("regime", {}) or {}
+                    sess    = market.get("market_session", "")
+                    entries = (market.get("session", {}) or {}).get(
+                        "entries_allowed", True
+                    )
+                    cr = compute_confidence(
+                        fields,
+                        reg_d.get("name", ""),
+                        float(reg_d.get("confidence", 0.5)),
+                        sess,
+                        entries,
+                    )
+                    base_conf = cr.score
+                except Exception:
+                    pass
+                calib     = calibrate_confidence(base_conf, ctx)
+                hist_block = summary_text(ctx, calibration=calib)
+        except Exception:
+            pass
+
+        parts = [thesis]
         if patterns:
-            return f"{thesis}\n\n{patterns}"
-        return thesis
+            parts.append(patterns)
+        if hist_block:
+            parts.append(hist_block)
+        return "\n\n".join(parts)
 
     if request_type == "market_commentary":
         from engine.confidence_engine import build_compact_thesis_from_package
