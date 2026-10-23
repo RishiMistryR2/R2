@@ -155,6 +155,21 @@ Tests: `tests/test_confidence_state.py` (pipeline, packager, prompt, dashboard,
 briefing stamp) and `tests/test_confidence_integration.py` (one shared value
 across all consumers).
 
+## Roadmap
+
+See **[docs/ML_DECISION_POINT.md](docs/ML_DECISION_POINT.md)**.
+
+- R2 uses **hand-coded weights by design**: confidence point values in
+  `compute_confidence`, pattern base rates in `_CATALOG`, and deterministic
+  calibration. This keeps every number explainable.
+- The question of moving to machine learning is **deferred** until every item
+  in the checklist at the top of that doc is met. Until then the job is to run
+  live sessions and let the Outcome Tracker collect data.
+- **Do not suggest adding ML before then.** That includes fitted or trained
+  weights, scikit-learn or similar libraries, clustering, or using the LLM as
+  the reasoner instead of the explainer. If asked, point to the doc and its
+  checklist.
+
 ## Working conventions — follow these strictly
 
 1. **Audit before editing.** Read the actual file before proposing any change.
