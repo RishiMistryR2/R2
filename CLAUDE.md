@@ -112,7 +112,8 @@ where the confidence pipeline failed); old JSON must keep loading.
   dependent and fails outside trading hours — not a real bug
 - Live Alpaca data works. Session transitions work. All engines integrated.
 - Outcome tracker is recording and resolving observations in live sessions.
-- **v2.7 is complete** (latest tag `v2.7.2`). No next version has been approved yet.
+- **v2.7 is complete.** Run `git tag --sort=-v:refname | head -1` for the latest
+  release tag. No next version has been approved yet.
 
 ## v2.7 — Single authoritative confidence (COMPLETE)
 
