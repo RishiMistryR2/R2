@@ -86,6 +86,12 @@ def run_update_cycle(state: RuntimeState) -> bool:
         except Exception:
             pass   # outcome tracker is always non-fatal
 
+        # ── v2.7: single authoritative confidence ───────────────────
+        # Runs after mark_update() so source_cycle matches this cycle's
+        # number, and after outcome resolution so calibration sees any
+        # outcomes resolved this tick.  Non-fatal internally.
+        _run_confidence_pipeline(state)
+
         logger.debug(
             f"[cycle #{state.update_count}]"
             f"  regime={_regime_label(market)}"
@@ -178,6 +184,104 @@ def _run_structure_engine(market) -> "Optional[Any]":
     except Exception as e:
         logger.warning(f"[cycle] StructureEngine error: {e}")
         return None
+
+
+def _run_confidence_pipeline(state: RuntimeState) -> None:
+    """
+    v2.7 — compute confidence once per update cycle and store it on
+    state.confidence_state.  Every consumer reads that stored value;
+    none recompute.
+
+    Never raises.  On failure it logs a warning and sets confidence_state
+    to None, so consumers use their own fallback rather than show a value
+    left over from an earlier cycle.
+    """
+    try:
+        state.confidence_state = _compute_confidence_state(state)
+    except Exception as e:
+        logger.warning(f"[cycle] Confidence pipeline error: {e}")
+        state.confidence_state = None
+
+
+def _compute_confidence_state(state: RuntimeState):
+    """
+    Build a ConfidenceState from the state committed this cycle.
+
+    structural_confidence — compute_confidence() over current structure,
+                            regime and session (no entries_allowed penalty)
+    calibrated_confidence — structural, adjusted by statistical_intelligence;
+                            equals structural if calibration fails
+    regime_confidence     — the regime classifier's own confidence
+    """
+    from engine.confidence_engine import ConfidenceState, compute_confidence
+    from engine.narrative_engine  import _to_fields, _session_key
+    from engine.pattern_engine    import classify_patterns
+
+    market   = state.market_state
+    struct   = state.structure_state
+    fields   = _to_fields(struct) if struct else {}
+    sess_key = _session_key(getattr(market, "market_session", None))
+
+    # Same regime extraction as event_engine._build()
+    regime_name = ""
+    regime_conf = 0.5
+    reg = getattr(market, "regime", None)
+    if reg:
+        try:
+            regime_name = reg.regime.value
+        except AttributeError:
+            regime_name = str(getattr(reg, "regime", ""))
+        regime_conf = float(getattr(reg, "confidence", 0.5))
+
+    # Structural thesis strength.  entries_allowed is deliberately not
+    # passed: entry readiness is an action filter, not evidence (v2.7).
+    cr         = compute_confidence(fields, regime_name, regime_conf, sess_key)
+    structural = float(cr.score)
+
+    # Historical calibration — guarded separately so a broken history
+    # layer never costs us the structural score.
+    calibrated  = structural
+    calibration = None
+    try:
+        from memory.statistical_intelligence import (
+            calibrate_confidence, get_historical_context,
+        )
+        patterns = classify_patterns(fields, regime=regime_name, session=sess_key)
+        # Same prediction rule outcome_tracker uses when recording history:
+        # the primary pattern's bias.
+        prediction = "neutral"
+        if patterns:
+            prediction = getattr(patterns[0], "bias", "neutral") or "neutral"
+        ctx = get_historical_context({
+            "pattern_names":    [p.name for p in patterns],
+            "confidence_score": structural,
+            "prediction":       prediction,
+        })
+        calibration = calibrate_confidence(
+            structural, ctx,
+            structure_direction=fields.get("direction") or None,
+        )
+        calibrated = float(calibration.final_confidence)
+    except Exception as e:
+        logger.warning(
+            f"[cycle] Confidence calibration error — using structural score: {e}"
+        )
+
+    logger.debug(
+        f"[confidence] cycle={state.update_count}"
+        f"  structural={structural:.1f}  calibrated={calibrated:.1f}"
+        f"  regime={regime_name or '-'}@{regime_conf:.2f}"
+        + (f"  calib: {calibration.explanation}" if calibration else "")
+    )
+
+    return ConfidenceState(
+        structural_confidence = structural,
+        calibrated_confidence = calibrated,
+        regime_confidence     = regime_conf,
+        calibration_result    = calibration,
+        computed_at           = datetime.now(tz=timezone.utc),
+        source_cycle          = state.update_count,
+    )
 
 # ──────────────────────────────────────────────
 # Demo / synthetic state builder
