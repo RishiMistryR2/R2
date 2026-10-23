@@ -266,6 +266,60 @@ def test_pipeline_on_empty_state_never_raises():
 
 
 # ──────────────────────────────────────────────────────────────
+# State packager — package["confidence"] (step 9)
+# ──────────────────────────────────────────────────────────────
+
+def _package(state):
+    from ai.state_packager import build_full_package
+    return build_full_package(
+        state=state.market_state, structure_state=state.structure_state,
+        confidence_state=state.confidence_state,
+    ).to_dict()
+
+
+def test_package_confidence_block_matches_state():
+    state, _ = _cycled()
+    cs  = state.confidence_state
+    blk = _package(state)["confidence"]
+    assert blk["structural"]   == round(cs.structural_confidence, 1)
+    assert blk["calibrated"]   == round(cs.calibrated_confidence, 1)
+    assert blk["regime"]       == round(cs.regime_confidence, 2)
+    assert blk["source_cycle"] == cs.source_cycle
+    assert blk["historical_adjustment"] == round(blk["calibrated"] - blk["structural"], 1)
+
+
+def test_package_confidence_includes_calibration_explanation():
+    state, _ = _cycled()
+    cal = _package(state)["confidence"]["calibration"]
+    assert cal["explanation"] == state.confidence_state.calibration_result.explanation
+    for key in ("raw_adjustment", "conflict_dampened", "dampen_reason", "age_filtered_count"):
+        assert key in cal
+
+
+def test_package_omits_confidence_when_none():
+    state, _ = _cycled()
+    state.confidence_state = None
+    assert "confidence" not in _package(state)
+
+
+def test_package_without_calibration_result():
+    state, _ = _cycled()
+    state.confidence_state.calibration_result = None
+    blk = _package(state)["confidence"]
+    assert "calibration" not in blk
+    assert blk["calibrated"] == round(state.confidence_state.calibrated_confidence, 1)
+
+
+def test_commentary_cycle_passes_confidence_state():
+    import runtime.commentary_cycle as cc
+    state, _ = _cycled()
+    with mock.patch.object(cc, "build_full_package",
+                           side_effect=RuntimeError("stop here")) as bfp:
+        cc.generate_commentary(state, trigger="user_request")
+    assert bfp.call_args.kwargs["confidence_state"] is state.confidence_state
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 

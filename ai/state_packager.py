@@ -46,6 +46,7 @@ class StatePackage:
     assembled_at:    str = ""
     market:          Optional[Dict] = None
     structure:       Optional[Dict] = None  # StructureState.to_dict()
+    confidence:      Optional[Dict] = None  # v2.7: ConfidenceState for this cycle
     setup:           Optional[Dict] = None
     context:         Optional[Dict] = None
     trade:           Optional[Dict] = None
@@ -58,8 +59,8 @@ class StatePackage:
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"assembled_at": self.assembled_at,
                               "request_type": self.request_type}
-        for key in ("market", "structure", "setup", "context", "trade",
-            "session", "patterns", "warnings"):
+        for key in ("market", "structure", "confidence", "setup", "context",
+            "trade", "session", "patterns", "warnings"):
             val = getattr(self, key)
             if val:
                 d[key] = val
@@ -411,6 +412,50 @@ def package_structure(structure_state) -> Optional[Dict]:
 
 
 # ──────────────────────────────────────────────
+# Confidence packager (v2.7)
+# ──────────────────────────────────────────────
+
+def package_confidence(confidence_state) -> Optional[Dict]:
+    """
+    Serialise the cycle's ConfidenceState.  Consumers read these values
+    instead of recomputing confidence.
+
+      structural            — evidence-based thesis strength
+      calibrated            — Final Conviction (structural + history)
+      historical_adjustment — calibrated − structural
+      regime                — regime classifier's own confidence (0–1)
+    """
+    if confidence_state is None:
+        return None
+    try:
+        cs         = confidence_state
+        structural = round(float(cs.structural_confidence), 1)
+        calibrated = round(float(cs.calibrated_confidence), 1)
+        out: Dict[str, Any] = {
+            "structural":            structural,
+            "calibrated":            calibrated,
+            "historical_adjustment": round(calibrated - structural, 1),
+            "regime":                round(float(cs.regime_confidence), 2),
+            "computed_at":           _iso(cs.computed_at),
+            "source_cycle":          cs.source_cycle,
+        }
+        cal = cs.calibration_result
+        if cal is not None:
+            out["calibration"] = {
+                "explanation":        cal.explanation,
+                "sufficient_history": cal.sufficient_history,
+                "sample_size":        cal.sample_size,
+                "raw_adjustment":     getattr(cal, "raw_adjustment", 0.0),
+                "conflict_dampened":  getattr(cal, "conflict_dampened", False),
+                "dampen_reason":      getattr(cal, "dampen_reason", ""),
+                "age_filtered_count": getattr(cal, "age_filtered_count", 0),
+            }
+        return out
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────
 # Full package builder
 # ──────────────────────────────────────────────
 
@@ -425,6 +470,7 @@ def build_full_package(
     warnings        = None,
     structure_state = None,  # engine.structure_engine.StructureState
     request_type:    str = "analysis",
+    confidence_state = None,  # v2.7: engine.confidence_engine.ConfidenceState
 ) -> StatePackage:
     """
     Assemble a complete StatePackage from all available inputs.
@@ -474,6 +520,7 @@ def build_full_package(
         assembled_at = now,
         market       = package_market_state(state)     if state          else None,
         structure    = package_structure(structure_state),
+        confidence   = package_confidence(confidence_state),
         setup        = package_setup(score, direction)  if score          else None,
         context      = package_context(context_state)   if context_state  else None,
         trade        = package_trade(active_trade)      if active_trade   else None,

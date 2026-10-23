@@ -159,6 +159,7 @@ def generate_commentary(
             warnings        = state.active_warnings,
             structure_state = state.structure_state,
             request_type    = trigger,
+            confidence_state = getattr(state, "confidence_state", None),
         )
 
         # ── Debug: confirm structure and session reached the package ────
