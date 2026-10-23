@@ -821,6 +821,255 @@ def test_bucket_for_boundary_values():
     assert s90.bucket_high == 90
 
 
+# ══════════════════════════════════════════════════════════════
+# v2.7 — staleness filter
+# ══════════════════════════════════════════════════════════════
+
+def _age_obs(tracker, oid, days):
+    """Backdate one observation's recorded_at by `days`."""
+    from datetime import datetime, timedelta, timezone
+    obs = tracker.get_observation(oid)
+    obs.recorded_at = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _tracker_with_stale(n_fresh, n_stale, stale_days=40, outcome="bearish"):
+    """Tracker with n_fresh current + n_stale backdated resolved observations."""
+    t = _fresh_tracker()
+    for _ in range(n_fresh):
+        _record_and_resolve(t, "Failed Breakout", "bearish", outcome, confidence=68.0)
+    for _ in range(n_stale):
+        oid = _record_and_resolve(t, "Failed Breakout", "bearish", outcome, confidence=68.0)
+        _age_obs(t, oid, stale_days)
+    return t
+
+
+def test_stale_observations_excluded_from_pattern_stats():
+    from memory.statistical_intelligence import get_historical_context
+    t   = _tracker_with_stale(n_fresh=4, n_stale=6)
+    ctx = get_historical_context(_snap_dict(confidence_score=68.0), tracker=t)
+    assert ctx.total_sample       == 4
+    assert ctx.age_filtered_count == 6
+
+
+def test_stale_filter_can_drop_below_min_sample():
+    # 12 obs total would be sufficient, but only 5 are recent.
+    from memory.statistical_intelligence import get_historical_context
+    t   = _tracker_with_stale(n_fresh=5, n_stale=7)
+    ctx = get_historical_context(_snap_dict(confidence_score=68.0), tracker=t)
+    assert ctx.has_sufficient_history is False
+
+
+def test_observations_within_30_days_kept():
+    from memory.statistical_intelligence import get_historical_context
+    t   = _tracker_with_stale(n_fresh=0, n_stale=10, stale_days=29)
+    ctx = get_historical_context(_snap_dict(confidence_score=68.0), tracker=t)
+    assert ctx.total_sample       == 10
+    assert ctx.age_filtered_count == 0
+
+
+def test_bucket_stats_exclude_stale():
+    from memory.statistical_intelligence import get_confidence_bucket_stats
+    t = _tracker_with_stale(n_fresh=3, n_stale=5)
+    s = get_confidence_bucket_stats(68.0, tracker=t)
+    assert s.sample_size == 3
+
+
+def test_directional_stats_exclude_stale():
+    from memory.statistical_intelligence import get_directional_stats
+    t = _tracker_with_stale(n_fresh=3, n_stale=5)
+    s = get_directional_stats("bearish", tracker=t)
+    assert s.sample_size == 3
+
+
+def test_all_stale_returns_none_for_bucket_and_directional():
+    from memory.statistical_intelligence import (
+        get_confidence_bucket_stats, get_directional_stats,
+    )
+    t = _tracker_with_stale(n_fresh=0, n_stale=5)
+    assert get_confidence_bucket_stats(68.0, tracker=t) is None
+    assert get_directional_stats("bearish", tracker=t) is None
+
+
+def test_max_age_days_none_disables_filter():
+    from memory.statistical_intelligence import (
+        get_historical_context, get_confidence_bucket_stats, get_directional_stats,
+    )
+    t   = _tracker_with_stale(n_fresh=4, n_stale=6)
+    ctx = get_historical_context(_snap_dict(confidence_score=68.0),
+                                 tracker=t, max_age_days=None)
+    assert ctx.total_sample       == 10
+    assert ctx.age_filtered_count == 0
+    assert get_confidence_bucket_stats(68.0, tracker=t, max_age_days=None).sample_size == 10
+    assert get_directional_stats("bearish", tracker=t, max_age_days=None).sample_size == 10
+
+
+def test_stale_pending_observations_not_counted():
+    # Only resolved observations would have influenced calibration, so only
+    # those count toward age_filtered_count.
+    from memory.statistical_intelligence import get_historical_context
+    t   = _tracker_with_stale(n_fresh=2, n_stale=3)
+    oid = t.record_observation(_snap_dict(), [_pat("Failed Breakout", "bearish")])
+    _age_obs(t, oid, 40)
+    ctx = get_historical_context(_snap_dict(confidence_score=68.0), tracker=t)
+    assert ctx.age_filtered_count == 3
+
+
+def test_unreadable_timestamp_kept():
+    from memory.statistical_intelligence import get_historical_context
+    t   = _fresh_tracker()
+    oid = _record_and_resolve(t, "Failed Breakout", "bearish", "bearish", confidence=68.0)
+    t.get_observation(oid).recorded_at = "not-a-timestamp"
+    ctx = get_historical_context(_snap_dict(confidence_score=68.0), tracker=t)
+    assert ctx.total_sample       == 1
+    assert ctx.age_filtered_count == 0
+
+
+def test_calibration_carries_age_filtered_count():
+    from memory.statistical_intelligence import get_historical_context, calibrate_confidence
+    t   = _tracker_with_stale(n_fresh=10, n_stale=4)
+    ctx = get_historical_context(_snap_dict(confidence_score=68.0), tracker=t)
+    r   = calibrate_confidence(68.0, ctx)
+    assert r.age_filtered_count == 4
+    assert "4 observations older than 30 days excluded" in r.explanation
+
+
+def test_calibration_insufficient_history_mentions_stale():
+    from memory.statistical_intelligence import get_historical_context, calibrate_confidence
+    t   = _tracker_with_stale(n_fresh=2, n_stale=1)
+    ctx = get_historical_context(_snap_dict(confidence_score=68.0), tracker=t)
+    r   = calibrate_confidence(68.0, ctx)
+    assert r.sufficient_history is False
+    assert r.age_filtered_count == 1
+    assert "1 observation older than 30 days excluded" in r.explanation
+
+
+def test_no_stale_note_when_nothing_filtered():
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(70.0, _ctx_with_accuracy(0.75, n=30))
+    assert "older than" not in r.explanation
+
+
+# ══════════════════════════════════════════════════════════════
+# v2.7 — conflict dampening
+# ══════════════════════════════════════════════════════════════
+
+def _ctx_dominant(dominant, accuracy=0.75, n=30):
+    """_ctx_with_accuracy, but with a chosen dominant historical outcome."""
+    ctx = _ctx_with_accuracy(accuracy, n=n)
+    ctx.dominant_outcome = dominant
+    return ctx
+
+
+def test_bearish_history_vs_uptrend_dampened():
+    from memory.statistical_intelligence import calibrate_confidence, CONFLICT_DAMPEN_FACTOR
+    r = calibrate_confidence(70.0, _ctx_dominant("bearish"), structure_direction="uptrend")
+    assert r.conflict_dampened is True
+    assert r.raw_adjustment > 0
+    assert abs(r.adjustment - r.raw_adjustment * CONFLICT_DAMPEN_FACTOR) <= 0.1
+    assert r.final_confidence == round(70.0 + r.adjustment, 1)
+
+
+def test_bullish_history_vs_downtrend_dampened():
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(70.0, _ctx_dominant("bullish"), structure_direction="downtrend")
+    assert r.conflict_dampened is True
+    assert abs(r.adjustment) < abs(r.raw_adjustment)
+
+
+def test_negative_adjustment_also_dampened():
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(70.0, _ctx_dominant("bearish", accuracy=0.25),
+                             structure_direction="uptrend")
+    assert r.conflict_dampened is True
+    assert r.raw_adjustment < r.adjustment < 0
+
+
+def test_aligned_history_not_dampened():
+    from memory.statistical_intelligence import calibrate_confidence
+    for dominant, direction in (("bearish", "downtrend"), ("bullish", "uptrend")):
+        r = calibrate_confidence(70.0, _ctx_dominant(dominant), structure_direction=direction)
+        assert r.conflict_dampened is False
+        assert r.adjustment    == r.raw_adjustment
+        assert r.dampen_reason == ""
+
+
+def test_no_dampening_without_clear_direction():
+    from memory.statistical_intelligence import calibrate_confidence
+    for direction in (None, "", "ranging"):
+        r = calibrate_confidence(70.0, _ctx_dominant("bearish"), structure_direction=direction)
+        assert r.conflict_dampened is False
+
+
+def test_no_dampening_for_inconclusive_history():
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(70.0, _ctx_dominant("inconclusive"), structure_direction="uptrend")
+    assert r.conflict_dampened is False
+
+
+def test_dampen_reason_is_plain_english():
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(70.0, _ctx_dominant("bearish"), structure_direction="uptrend")
+    assert "bearish" in r.dampen_reason and "uptrend" in r.dampen_reason
+    assert "reduced from" in r.explanation
+    assert f"{r.raw_adjustment:+.1f}" in r.explanation
+    assert f"{r.adjustment:+.1f}" in r.explanation
+
+
+def test_dampened_result_still_clamped():
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(88.0, _ctx_dominant("bearish", accuracy=1.0),
+                             structure_direction="uptrend")
+    assert r.final_confidence <= 90.0
+
+
+def test_insufficient_history_never_dampened():
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(70.0, _ctx_dominant("bearish", n=5), structure_direction="uptrend")
+    assert r.sufficient_history is False
+    assert r.conflict_dampened  is False
+    assert r.adjustment == 0.0 and r.raw_adjustment == 0.0
+
+
+# ══════════════════════════════════════════════════════════════
+# v2.7 — new CalibrationResult fields / backward compatibility
+# ══════════════════════════════════════════════════════════════
+
+def test_raw_adjustment_matches_adjustment_by_default():
+    # Old two-argument call: no direction, so no dampening.
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(70.0, _ctx_with_accuracy(0.75, n=30))
+    assert r.raw_adjustment    == r.adjustment
+    assert r.conflict_dampened is False
+    assert r.dampen_reason     == ""
+    assert r.age_filtered_count == 0
+
+
+def test_new_fields_have_correct_types():
+    from memory.statistical_intelligence import calibrate_confidence
+    r = calibrate_confidence(70.0, _ctx_dominant("bearish"), structure_direction="uptrend")
+    assert isinstance(r.raw_adjustment,     float)
+    assert isinstance(r.conflict_dampened,  bool)
+    assert isinstance(r.dampen_reason,      str)
+    assert isinstance(r.age_filtered_count, int)
+
+
+def test_calibration_result_constructible_without_new_fields():
+    from memory.statistical_intelligence import CalibrationResult
+    r = CalibrationResult(
+        base_confidence=60.0, final_confidence=60.0, adjustment=0.0,
+        sufficient_history=False, win_rate=0.0, sample_size=0, explanation="x",
+    )
+    assert r.raw_adjustment == 0.0
+    assert r.conflict_dampened is False
+    assert r.dampen_reason == ""
+    assert r.age_filtered_count == 0
+
+
+def test_historical_context_age_filtered_defaults_to_zero():
+    ctx = _ctx_with_accuracy(0.6, n=12)
+    assert ctx.age_filtered_count == 0
+
+
 # ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
