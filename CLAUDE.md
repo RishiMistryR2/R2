@@ -76,6 +76,17 @@ storing calibrated values would feed past calibration back into future
 calibration. The calibrated value is kept alongside in
 `PatternObservation.calibrated_confidence` for audit only.
 
+Each new observation also records `schema_version` (currently 2,
+`OBSERVATION_SCHEMA_VERSION` in `memory/outcome_tracker.py`) and `evidence`:
+one `{"key", "points", "polarity"}` dict per `EvidenceItem` that
+`compute_confidence` applied. The items must always satisfy
+`clamp(35 + sum(points), 15, 90) == score`, so **any change to a score
+adjustment in `compute_confidence` must emit a matching `EvidenceItem`**
+(add new keys to `_KNOWN_EVIDENCE_KEYS` in `tests/test_confidence_engine.py`).
+If the meaning of a stored field changes, bump `OBSERVATION_SCHEMA_VERSION`.
+`None` in either field means "not recorded" (pre-v2.7 records, or a cycle
+where the confidence pipeline failed); old JSON must keep loading.
+
 ## Version history
 
 | Version | What it added | Commit |
