@@ -377,16 +377,18 @@ def _commit_commentary(state: RuntimeState, text: str, trigger: str) -> None:
     """
     Store commentary in RuntimeState and append full text to event log.
 
-    No fixed-length truncation — the dashboard wraps long lines at render
-    time via _render_events_section.  Collapsing whitespace keeps the event
-    as a single logical line.
+    Logged via add_event, so the entry is timestamped
+    ("HH:MM:SS  AI [trigger]: text") and subject to the rolling max_events
+    cap like every other event.  No fixed-length truncation — the dashboard
+    decides how much to show.  Collapsing whitespace keeps the event as a
+    single logical line.
     """
     state.latest_commentary = text
     state.commentary_type   = trigger
     state.commentary_at     = datetime.now(tz=timezone.utc)
     # Collapse internal whitespace so the event is one logical line
     flat = " ".join(text.split())
-    state.recent_events.append(f"AI [{trigger}]: {flat}")
+    state.add_event(f"AI [{trigger}]: {flat}")
 
 
 def _build_fallback_answer(state: RuntimeState, question: str) -> str:

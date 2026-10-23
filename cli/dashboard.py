@@ -445,23 +445,24 @@ def _conviction_panel(confidence_state) -> Panel:
 
         rows: list = [
             big_number(f"{final:.0f}%", style),
-            Text.assemble(("Final Conviction ", "dim"), (f"{final:.0f}%", f"bold {style}"),
-                          "  ", (label, style)),
+            _Chunks(("", Text.assemble(("Final Conviction ", "dim"),
+                                       (f"{final:.0f}%", f"bold {style}"))),
+                    ("  ", Text(label, style=style))),
         ]
         insufficient = cal is not None and not cal.sufficient_history
         if insufficient or abs(delta) < 0.5:
             adj = Text("none", style="dim")
         else:
             adj = Text(f"{delta:+.0f} pts", style="green" if delta > 0 else "red")
-        rows.append(Text.assemble(("Historical Adjustment ", "dim"), adj))
+        rows.append(_Chunks(("", Text("Historical Adjustment", style="dim")), (" ", adj)))
 
-        small = Text(f"structural {structural:.0f}%", style="dim")
+        small: list = [("", Text(f"structural {structural:.0f}%", style="dim"))]
         if insufficient:
-            small.append(f" · {cal.sample_size} obs, need {MIN_SAMPLE_SIZE}", style="dim")
+            small.append((" · ", Text(f"{cal.sample_size} obs, need {MIN_SAMPLE_SIZE}",
+                                      style="dim")))
         if cal is not None and getattr(cal, "conflict_dampened", False):
-            small.append("  ")
-            small.append(" dampened ", style="black on yellow")
-        rows.append(small)
+            small.append(("  ", Text(" dampened ", style="black on yellow")))
+        rows.append(_Chunks(*small))
         return _panel(Group(*rows), "CONVICTION")
     except Exception:
         return _panel(Text("Confidence unavailable", style="dim"), "CONVICTION")
@@ -514,6 +515,38 @@ def parse_event(event: str) -> tuple:
     if m:
         trigger, rest = m.group(1), m.group(2)
     return ts, trigger, rest
+
+
+class _Chunks:
+    """
+    Lay out (separator, Text) pieces greedily, breaking lines only between
+    pieces — never inside one — and dropping the separator at a break.
+    Keeps "Final Conviction 63%" together on narrow columns instead of
+    splitting mid-phrase.  A single piece wider than the column wraps.
+    """
+
+    def __init__(self, *pieces) -> None:
+        self.pieces = [(sep, t if isinstance(t, Text) else Text(t)) for sep, t in pieces]
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        width = options.max_width
+        lines: list = []
+        cur: Optional[Text] = None
+        for sep, piece in self.pieces:
+            if cur is not None and cur.cell_len + len(sep) + piece.cell_len <= width:
+                cur.append(sep)
+                cur.append_text(piece)
+                continue
+            if cur is not None:
+                lines.append(cur)
+            cur = piece.copy()
+        if cur is not None:
+            lines.append(cur)
+        for line in lines:
+            if line.cell_len > width:
+                yield from line.wrap(console, width)
+            else:
+                yield line
 
 
 class _Clamped:

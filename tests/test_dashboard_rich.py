@@ -291,6 +291,88 @@ def test_layout_not_padded_to_tall_terminal():
 
 
 # ──────────────────────────────────────────────────────────────
+# Narrow terminals — conviction text breaks only between pieces
+# ──────────────────────────────────────────────────────────────
+
+def _conviction_lines(out):
+    """Text inside the CONVICTION panel, one entry per row."""
+    lines = out.splitlines()
+    top   = next(i for i, l in enumerate(lines) if "╭─ CONVICTION" in l)
+    x     = lines[top].index("╭─ CONVICTION")
+    rows  = []
+    for line in lines[top + 1:]:
+        cell = line[x:]
+        if cell.startswith("╰"):
+            break
+        rows.append(cell.strip(" │"))
+    return rows
+
+
+def test_conviction_text_kept_whole_at_80_cols():
+    from cli.dashboard import render_dashboard_rich
+    s  = _cycled()
+    cs = s.confidence_state
+    cs.calibration_result.sufficient_history = False
+    cs.calibration_result.sample_size = 4
+    rows = _conviction_lines(_text(render_dashboard_rich(s.market_state,
+                                                         confidence_state=cs), width=80))
+    assert any(r.startswith("Final Conviction") and r.endswith("%") for r in rows), rows
+    assert any(r in ("Moderate-High", "Moderate", "High", "Low") for r in rows), rows
+    assert "4 obs, need 10" in rows, rows               # never split as "need" / "10"
+    assert any(r.startswith("Historical Adjustment") for r in rows), rows
+
+
+def test_conviction_single_line_at_100_cols():
+    from cli.dashboard import render_dashboard_rich
+    s  = _cycled()
+    rows = _conviction_lines(_text(render_dashboard_rich(
+        s.market_state, confidence_state=s.confidence_state), width=100))
+    line = next(r for r in rows if r.startswith("Final Conviction"))
+    assert "Moderate-High" in line
+
+
+def test_chunks_break_between_pieces_and_drop_separator():
+    from rich.text import Text
+    from cli.dashboard import _Chunks
+    c = _Chunks(("", Text("alpha beta")), ("  ", Text("gamma")), (" · ", Text("delta epsilon")))
+    assert _text(c, width=40).splitlines() == ["alpha beta  gamma · delta epsilon"]
+    assert _text(c, width=16).splitlines() == ["alpha beta", "gamma", "delta epsilon"]
+
+
+# ──────────────────────────────────────────────────────────────
+# Event timestamps
+# ──────────────────────────────────────────────────────────────
+
+def test_commentary_event_is_timestamped_and_shown():
+    from runtime.commentary_cycle import _commit_commentary
+    from cli.dashboard import parse_event, render_dashboard
+    s = _cycled()
+    _commit_commentary(s, "Buyers defended support.", "regime_change")
+    ts, trigger, text = parse_event(s.recent_events[-1])
+    assert ts and trigger == "regime_change" and text == "Buyers defended support."
+    assert f"{ts} [regime_change] Buyers defended support." in render_dashboard(
+        s.market_state, recent_events=s.recent_events)
+
+
+def test_event_timestamps_use_eastern_time():
+    from runtime.runtime_state import RuntimeState
+    s = RuntimeState()
+    with mock.patch("engine.market_session.to_et_string", return_value="09:31:05 ET"):
+        s.add_event("Session opened")
+    assert s.recent_events[-1] == "09:31:05  Session opened"
+
+
+def test_commentary_events_respect_rolling_cap():
+    from runtime.commentary_cycle import _commit_commentary
+    from runtime.runtime_state import RuntimeState
+    s = RuntimeState(max_events=3)
+    for i in range(5):
+        _commit_commentary(s, f"note {i}", "periodic_check")
+    assert len(s.recent_events) == 3
+    assert "note 4" in s.recent_events[-1]
+
+
+# ──────────────────────────────────────────────────────────────
 # runtime_loop
 # ──────────────────────────────────────────────────────────────
 

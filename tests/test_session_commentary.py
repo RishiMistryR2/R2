@@ -415,7 +415,10 @@ def test_commit_commentary_prefix():
     from runtime.commentary_cycle import _commit_commentary
     s = RuntimeState()
     _commit_commentary(s, "test text", "regime_change")
-    assert s.recent_events[-1].startswith("AI [regime_change]:")
+    # Commentary is now logged via add_event, so a "HH:MM:SS  " timestamp
+    # precedes the "AI [trigger]:" prefix.
+    import re
+    assert re.match(r"^\d{2}:\d{2}:\d{2}  AI \[regime_change\]: ", s.recent_events[-1])
 
 
 def test_log_structure_debug_no_crash_with_none():

@@ -179,8 +179,16 @@ class RuntimeState:
     # ──────────────────────────────────────────
 
     def add_event(self, msg: str) -> None:
-        """Add a timestamped entry to the rolling event log."""
-        ts    = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+        """
+        Add a timestamped entry ("HH:MM:SS  msg", Eastern time — the same
+        clock the dashboard shows) to the rolling event log.
+        """
+        now = datetime.now(tz=timezone.utc)
+        try:
+            from engine.market_session import to_et_string
+            ts = to_et_string(now).removesuffix(" ET")
+        except Exception:
+            ts = now.strftime("%H:%M:%S")
         entry = f"{ts}  {msg}"
         self.recent_events.append(entry)
         if len(self.recent_events) > self.max_events:
