@@ -320,6 +320,45 @@ def test_commentary_cycle_passes_confidence_state():
 
 
 # ──────────────────────────────────────────────────────────────
+# Claude client — mock commentary reads the stored value (step 10)
+# ──────────────────────────────────────────────────────────────
+
+def _built_package(state, request_type):
+    from ai.state_packager import build_full_package
+    return build_full_package(
+        state=state.market_state, structure_state=state.structure_state,
+        confidence_state=state.confidence_state, request_type=request_type,
+    )
+
+
+def test_mock_commentary_shows_stored_calibrated():
+    from ai.claude_client import _generate_mock_response
+    state, _ = _cycled()
+    state.confidence_state.calibrated_confidence = 81.0
+    for rt in ("startup_briefing", "market_commentary"):
+        text = _generate_mock_response(rt, _built_package(state, rt))
+        assert "Confidence: 81%" in text, rt
+
+
+def test_startup_briefing_does_not_recalibrate():
+    import memory.statistical_intelligence as si
+    from ai.claude_client import _generate_mock_response
+    from runtime.update_cycle import run_update_cycle
+    state, tracker = _fresh()
+    _seed_history(tracker, "Test Pattern", "bullish", "bullish")
+    with mock.patch("engine.pattern_engine.classify_patterns",
+                    return_value=[_Pat("Test Pattern", "bullish")]):
+        run_update_cycle(state)
+        pkg = _built_package(state, "startup_briefing")
+        with mock.patch.object(si, "calibrate_confidence",
+                               side_effect=AssertionError("recalibrated")), \
+             mock.patch("engine.pattern_engine.build_pattern_narrative_from_package",
+                        return_value=""):
+            text = _generate_mock_response("startup_briefing", pkg)
+    assert state.confidence_state.calibration_result.explanation in text
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 

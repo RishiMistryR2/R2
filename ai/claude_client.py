@@ -138,8 +138,18 @@ def _generate_mock_response(request_type: str, package: StatePackage) -> str:
         # ── Statistical intelligence: historical context block ─────
         hist_block = ""
         try:
-            ctx = get_historical_context_from_package(d)
-            if ctx.has_sufficient_history:
+            ctx    = get_historical_context_from_package(d)
+            stored = ((d.get("confidence") or {}).get("calibration")
+                      if isinstance(d.get("confidence"), dict) else None)
+            if ctx.has_sufficient_history and stored is not None:
+                # v2.7: use the calibration computed once this cycle —
+                # never recalibrate here.  Same layout summary_text() uses.
+                hist_block = summary_text(ctx)
+                if stored.get("sufficient_history") and stored.get("explanation"):
+                    hist_block += f"\n  {stored['explanation']}"
+            elif ctx.has_sufficient_history:
+                # Fallback for packages without a confidence block
+                # (e.g. built outside the update cycle).
                 # Re-derive base confidence from package for calibration
                 base_conf = 50.0
                 try:

@@ -520,6 +520,66 @@ def test_accepts_structure_state_object():
 
 
 # ──────────────────────────────────────────────────────────────
+# v2.7 — thesis text shows the stored Final Conviction
+# ──────────────────────────────────────────────────────────────
+
+def test_thesis_without_stored_value_unchanged():
+    from engine.confidence_engine import build_thesis, compute_confidence
+    cr   = compute_confidence(_uptrend())
+    text = build_thesis(_uptrend())
+    assert f"Confidence: {cr.score:.0f}% ({cr.label})" in text
+    assert "historical adjustment" not in text.lower()
+
+
+def test_thesis_shows_stored_final_confidence():
+    from engine.confidence_engine import build_thesis, compute_confidence
+    cr   = compute_confidence(_uptrend())
+    text = build_thesis(_uptrend(), final_confidence=cr.score + 8,
+                        structural_confidence=cr.score)
+    assert f"Confidence: {cr.score + 8:.0f}%" in text
+    assert "Historical adjustment +8" in text or "historical adjustment +8" in text
+    assert f"Structural {cr.score:.0f}%" in text
+
+
+def test_thesis_label_and_conviction_follow_final_value():
+    from engine.confidence_engine import build_thesis
+    text = build_thesis(_uptrend(), final_confidence=80.0, structural_confidence=70.0)
+    assert "Confidence: 80% (High)" in text
+    assert "Conviction: High." in text
+
+
+def test_thesis_no_adjustment_note_when_equal():
+    from engine.confidence_engine import build_thesis, compute_confidence
+    cr   = compute_confidence(_uptrend())
+    text = build_thesis(_uptrend(), final_confidence=cr.score,
+                        structural_confidence=cr.score)
+    assert "historical adjustment" not in text.lower()
+
+
+def test_compact_thesis_shows_stored_final_confidence():
+    from engine.confidence_engine import build_compact_thesis
+    text = build_compact_thesis(_uptrend(), final_confidence=50.0,
+                                structural_confidence=56.0)
+    assert "Confidence: 50% (Moderate; structural 56%, historical adjustment -6)" in text
+
+
+def test_thesis_from_package_reads_confidence_block():
+    from engine.confidence_engine import (
+        build_thesis_from_package, build_compact_thesis_from_package,
+    )
+    pkg = {"structure": _uptrend(),
+           "confidence": {"structural": 62.0, "calibrated": 71.0}}
+    assert "Confidence: 71%" in build_thesis_from_package(pkg)
+    assert "Confidence: 71%" in build_compact_thesis_from_package(pkg)
+
+
+def test_thesis_from_package_without_block_falls_back():
+    from engine.confidence_engine import build_thesis_from_package, compute_confidence
+    cr = compute_confidence(_uptrend())
+    assert f"Confidence: {cr.score:.0f}%" in build_thesis_from_package({"structure": _uptrend()})
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 

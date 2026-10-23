@@ -298,18 +298,7 @@ def compute_confidence(
     score = max(15.0, min(90.0, score))
 
     # ── Labels ─────────────────────────────────────────────────
-    if score >= 75:
-        label      = "High"
-        conviction = "High"
-    elif score >= 60:
-        label      = "Moderate-High"
-        conviction = "Moderate"
-    elif score >= 45:
-        label      = "Moderate"
-        conviction = "Moderate"
-    else:
-        label      = "Low"
-        conviction = "Low"
+    label, conviction = _label_for(score)
 
     return ConfidenceResult(
         score=round(score, 1),
@@ -318,6 +307,45 @@ def compute_confidence(
         contradicting=contradicting,
         conviction=conviction,
     )
+
+
+def _label_for(score: float) -> tuple[str, str]:
+    """(label, conviction) for a confidence score."""
+    if score >= 75:
+        return "High", "High"
+    if score >= 60:
+        return "Moderate-High", "Moderate"
+    if score >= 45:
+        return "Moderate", "Moderate"
+    return "Low", "Low"
+
+
+def _displayed_confidence(
+    cr:                    ConfidenceResult,
+    final_confidence:      Optional[float],
+    structural_confidence: Optional[float],
+) -> tuple[float, str, str, str]:
+    """
+    v2.7 — the score shown in thesis text.
+
+    When the cycle's stored Final Conviction is supplied, show it (with its
+    own label/conviction) and explain any historical adjustment.  Otherwise
+    show the structural score computed here.
+
+    Returns (score, label, conviction, adjustment_note).
+    """
+    if final_confidence is None:
+        return cr.score, cr.label, cr.conviction, ""
+    final      = float(final_confidence)
+    structural = float(structural_confidence
+                       if structural_confidence is not None else cr.score)
+    label, conviction = _label_for(final)
+    delta = final - structural
+    note  = ""
+    if abs(delta) >= 0.5:
+        note = (f"structural {structural:.0f}%, "
+                f"historical adjustment {delta:+.0f}")
+    return final, label, conviction, note
 
 
 # ──────────────────────────────────────────────────────────────
@@ -332,6 +360,8 @@ def build_thesis(
     entries_allowed: bool  = True,
     current_price:   Optional[float] = None,
     symbol:          str   = "SPY",
+    final_confidence:      Optional[float] = None,
+    structural_confidence: Optional[float] = None,
 ) -> str:
     """
     Full multi-line thesis block:
@@ -342,6 +372,11 @@ def build_thesis(
       Conviction: X.
 
     Suitable for startup_briefing where space allows structured output.
+
+    v2.7: pass final_confidence (and structural_confidence) from the
+    cycle's ConfidenceState to display the stored value instead of the
+    score computed here.  Evidence lists always come from the structural
+    evaluation.
     """
     from engine.narrative_engine import _to_fields, _session_key, _SESS_PREFIX
 
@@ -416,8 +451,14 @@ def build_thesis(
     if level_line:
         lines.append(level_line)
 
+    shown, shown_label, shown_conv, adj_note = _displayed_confidence(
+        cr, final_confidence, structural_confidence,
+    )
+
     lines.append("")
-    lines.append(f"Confidence: {cr.score:.0f}% ({cr.label})")
+    lines.append(f"Confidence: {shown:.0f}% ({shown_label})")
+    if adj_note:
+        lines.append(f"  ({adj_note[0].upper()}{adj_note[1:]}.)")
 
     if cr.supporting:
         lines.append("")
@@ -439,7 +480,7 @@ def build_thesis(
         lines.append(invalid_line)
 
     lines.append("")
-    lines.append(f"Conviction: {cr.conviction}.")
+    lines.append(f"Conviction: {shown_conv}.")
 
     return "\n".join(lines)
 
@@ -456,6 +497,8 @@ def build_compact_thesis(
     entries_allowed: bool  = True,
     current_price:   Optional[float] = None,
     symbol:          str   = "SPY",
+    final_confidence:      Optional[float] = None,
+    structural_confidence: Optional[float] = None,
 ) -> str:
     """
     Compact form: prose narrative (from narrative_engine) with a one-line
@@ -482,9 +525,14 @@ def build_compact_thesis(
         fields, regime_name, regime_conf, sess_key, entries_allowed
     )
 
+    shown, shown_label, shown_conv, adj_note = _displayed_confidence(
+        cr, final_confidence, structural_confidence,
+    )
+    detail = f"{shown_label}; {adj_note}" if adj_note else shown_label
+
     return (
         f"{narrative}\n"
-        f"Confidence: {cr.score:.0f}% ({cr.label}) — Conviction: {cr.conviction}."
+        f"Confidence: {shown:.0f}% ({detail}) — Conviction: {shown_conv}."
     )
 
 
@@ -495,6 +543,7 @@ def build_compact_thesis(
 def build_thesis_from_package(package_dict: dict) -> str:
     """Full thesis block from a StatePackage.to_dict() result."""
     m, struct, regime_name, regime_conf, sess, entries, price = _unpack(package_dict)
+    final, structural = _stored_confidence(package_dict)
     return build_thesis(
         struct,
         regime_name     = regime_name,
@@ -502,12 +551,15 @@ def build_thesis_from_package(package_dict: dict) -> str:
         session         = sess,
         entries_allowed = entries,
         current_price   = price,
+        final_confidence      = final,
+        structural_confidence = structural,
     )
 
 
 def build_compact_thesis_from_package(package_dict: dict) -> str:
     """Compact thesis from a StatePackage.to_dict() result."""
     m, struct, regime_name, regime_conf, sess, entries, price = _unpack(package_dict)
+    final, structural = _stored_confidence(package_dict)
     return build_compact_thesis(
         struct,
         regime_name     = regime_name,
@@ -515,7 +567,24 @@ def build_compact_thesis_from_package(package_dict: dict) -> str:
         session         = sess,
         entries_allowed = entries,
         current_price   = price,
+        final_confidence      = final,
+        structural_confidence = structural,
     )
+
+
+def _stored_confidence(d: dict) -> tuple[Optional[float], Optional[float]]:
+    """
+    (calibrated, structural) from package["confidence"] — the v2.7 block
+    written by state_packager.  (None, None) when the package has none.
+    """
+    blk = d.get("confidence") or {}
+    try:
+        final = blk.get("calibrated")
+        struc = blk.get("structural")
+        return (float(final) if final is not None else None,
+                float(struc) if struc is not None else None)
+    except (TypeError, ValueError):
+        return None, None
 
 
 def _unpack(d: dict):
