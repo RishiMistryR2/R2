@@ -673,10 +673,11 @@ def test_dashboard_render_includes_wrapped_events():
         "is adequate for selective long entries on pullbacks."
     )
     result = render_dashboard(state, recent_events=[long_commentary])
+    # Rich panel: each event is clamped to 2 rows, so check the trigger and
+    # the opening text rather than the full commentary.
     assert "RECENT EVENTS" in result
+    assert "[regime_change]" in result
     assert "trending-bull" in result
-    assert "pullbacks" in result
-    assert "…" not in result
 
 
 # ═══════════════════════════════════════════════════════════

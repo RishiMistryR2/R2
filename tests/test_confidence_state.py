@@ -415,63 +415,84 @@ def test_dashboard_without_confidence_state_unchanged():
     assert "Historical Adjustment" not in out
 
 
+# Rewritten for the Rich layout: these check the same values as before
+# (conviction %, label, signed adjustment, structural %, sample note,
+# dampened tag, regime % kept separate), not the old one-line text format.
+
+def _line_with(out, needle):
+    return next(l for l in out.split("\n") if needle in l)
+
+
 def test_dashboard_shows_final_conviction_with_label():
     state, _ = _cycled()
-    out = _render(state, 69.0, 72.0, _cal())
-    assert "Final Conviction      : 72%  (Moderate-High)" in out
+    out  = _render(state, 69.0, 72.0, _cal())
+    line = _line_with(out, "Final Conviction")
+    assert "72%" in line and "Moderate-High" in line
 
 
 def test_dashboard_shows_historical_adjustment():
     state, _ = _cycled()
     out = _render(state, 69.0, 72.0, _cal())
-    assert "Historical Adjustment : +3 pts  · structural 69%" in out
+    assert "+3 pts" in _line_with(out, "Historical Adjustment")
+    assert "structural 69%" in out
 
 
 def test_dashboard_negative_adjustment():
     state, _ = _cycled()
     out = _render(state, 69.0, 61.0, _cal())
-    assert "Historical Adjustment : -8 pts  · structural 69%" in out
+    assert "-8 pts" in _line_with(out, "Historical Adjustment")
+    assert "structural 69%" in out
 
 
 def test_dashboard_insufficient_history_explained():
     state, _ = _cycled()
     out = _render(state, 63.0, 63.0, _cal(sufficient=False, n=4))
-    assert "Historical Adjustment : none  · 4 obs, need 10" in out
+    assert "none" in _line_with(out, "Historical Adjustment")
+    assert "4 obs, need 10" in out
 
 
 def test_dashboard_no_adjustment_with_history():
     state, _ = _cycled()
     out = _render(state, 63.0, 63.2, _cal())
-    assert "Historical Adjustment : none  · structural 63%" in out
+    assert "none" in _line_with(out, "Historical Adjustment")
+    assert "structural 63%" in out
+    assert "obs, need" not in out
 
 
 def test_dashboard_marks_dampened():
     state, _ = _cycled()
-    out = _render(state, 69.0, 72.0, _cal(dampened=True))
-    assert "· dampened" in out
+    assert "dampened" in _render(state, 69.0, 72.0, _cal(dampened=True))
+    assert "dampened" not in _render(state, 69.0, 72.0, _cal(dampened=False))
 
 
 def test_dashboard_regime_confidence_kept_separate():
+    # Regime % appears on the Regime line (MARKET), never as the conviction.
     state, _ = _cycled()
-    out = _render(state, 69.0, 72.0, _cal())
-    regime_pct = f"({state.market_state.regime.confidence:.0%})"
-    assert any(l.strip().startswith("Regime") and regime_pct in l for l in out.split("\n"))
+    out = _render(state, 61.0, 66.0, _cal())   # conviction must differ from regime %
+    regime_pct = f"{state.market_state.regime.confidence:.0%}"
+    assert regime_pct != "66%"
+    regime_line = _line_with(out, "Regime ")
+    assert regime_pct in regime_line.split("Regime ", 1)[1].split("│")[0]
+    assert regime_pct not in _line_with(out, "Final Conviction").split("Final Conviction")[1]
 
 
-def test_dashboard_conviction_lines_fit_box():
-    from cli.dashboard import WIDTH
+def test_dashboard_conviction_text_does_not_wrap():
+    # Replaces the 72-col box test: in the 40% column, each conviction line
+    # must keep its label and value together at the 100-col export width.
     state, _ = _cycled()
     out = _render(state, 50.0, 65.0, _cal(dampened=True))
-    for line in out.split("\n"):
-        if "Conviction" in line or "Historical Adjustment" in line:
-            assert len(line) <= WIDTH, line
+    assert "65%" in _line_with(out, "Final Conviction")
+    assert "+15 pts" in _line_with(out, "Historical Adjustment")
+    out = _render(state, 63.0, 63.0, _cal(sufficient=False, n=4))
+    assert "need 10" in _line_with(out, "structural 63%")
 
 
 def test_runtime_loop_passes_confidence_state():
+    # runtime_loop now renders the Rich layout (render_dashboard_rich).
     import runtime.runtime_loop as rl
     state, _ = _cycled()
-    with mock.patch.object(rl, "render_dashboard", return_value="") as rd, \
-         mock.patch("builtins.print"):
+    with mock.patch.object(rl, "render_dashboard_rich", return_value="") as rd, \
+         mock.patch.object(rl, "_console"):
         rl._render_dashboard(state)
     assert rd.call_args.kwargs["confidence_state"] is state.confidence_state
 

@@ -11,12 +11,12 @@ aiohttp>=3.9.0               # async HTTP for news fetching, fallback REST
 # Timezone handling
 pytz>=2024.1                 # ET session phase computation
 
+# Terminal dashboard
+rich>=13.7.0                 # cli/dashboard.py layout and colors
+
 # ── Optional runtime (install when ready for each phase) ──────────────────
 # Phase 4 context layer
 # feedparser>=6.0.11         # Federal Reserve + other RSS feeds (simple XML)
-
-# Phase 7 CLI
-# rich>=13.7.0               # terminal dashboard rendering
 
 # Phase 8 voice (not active in v1)
 # openai-whisper>=20231117   # local STT — optional, not active in v1

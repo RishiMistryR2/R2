@@ -29,12 +29,15 @@ from datetime import datetime, timezone
 # Module-level imports — required for mock.patch("runtime.runtime_loop.X") to work
 from runtime.update_cycle import run_update_cycle
 from runtime.commentary_cycle import generate_commentary, generate_startup_briefing_commentary
-from cli.dashboard import render_dashboard
+from cli.dashboard import render_dashboard, render_dashboard_rich  # noqa: F401  (plain-text export kept importable)
+from rich.console import Console
 
 from runtime.runtime_state import RuntimeState, RuntimeStatus
 from runtime.scheduler import Scheduler
 
 logger = logging.getLogger("runtime.loop")
+
+_console = Console()
 
 # Minimum sleep between loop iterations (prevents CPU spin)
 MIN_SLEEP_SECONDS = 0.5
@@ -129,9 +132,9 @@ def _run_commentary(state: RuntimeState, scheduler: Scheduler) -> None:
 
 
 def _render_dashboard(state: RuntimeState) -> None:
-    """Print dashboard to terminal. Failure is non-fatal."""
+    """Redraw the Rich dashboard in place (clear + print). Failure is non-fatal."""
     try:
-        output = render_dashboard(
+        layout = render_dashboard_rich(
             state           = state.market_state,
             score           = state.setup_score,
             context_state   = state.context_state,
@@ -143,16 +146,9 @@ def _render_dashboard(state: RuntimeState) -> None:
             recent_events   = state.recent_events,
             confidence_state = getattr(state, "confidence_state", None),
         )
-        print(output, flush=True)
-
-        # Show latest commentary if recent (< 5 minutes old)
-        if state.latest_commentary and state.commentary_at:
-            age = (datetime.now(tz=timezone.utc) - state.commentary_at).total_seconds()
-            if age < 300:
-                print(
-                    f"\n  ── R2 ──\n  {state.latest_commentary[:300]}\n",
-                    flush=True,
-                )
+        # Latest commentary is already in the RECENT EVENTS panel — not printed again.
+        _console.clear()
+        _console.print(layout)
     except Exception as e:
         logger.warning(f"[loop] Dashboard render error: {e}")
 

@@ -131,7 +131,7 @@ def test_all_consumers_show_the_same_value():
     assert pkg_block["calibrated"]  == round(final, 1)
     assert _shown_pct(briefing)     == [expected]
     assert _shown_pct(comment)      == [expected]
-    assert f"Final Conviction      : {expected}%" in dash
+    assert f"Final Conviction {expected}%" in dash
 
 
 def test_adjustment_explained_consistently():
@@ -151,7 +151,7 @@ def test_adjustment_explained_consistently():
     assert pkg_block["historical_adjustment"] == round(
         pkg_block["calibrated"] - pkg_block["structural"], 1)
     assert f"historical adjustment {delta:+.0f}" in briefing.lower()
-    assert f"Historical Adjustment : {delta:+.0f} pts" in dash
+    assert f"Historical Adjustment {delta:+.0f} pts" in dash
     assert cs.calibration_result.explanation in briefing
 
 
