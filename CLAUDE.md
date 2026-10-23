@@ -102,15 +102,17 @@ where the confidence pipeline failed); old JSON must keep loading.
 | v2.5 | Outcome tracker — records events, resolves outcomes, strategy abstraction | *(in outcome_tracker)* |
 | v2.6 | Statistical intelligence — historical context, confidence calibration | `a5588b1` |
 | v2.7 | Single authoritative ConfidenceState (steps 1–15) | `4dd33c8` … `8fa99ab` |
+| v2.7.1 | Fix: `trend_bear` fallback narrative produced bullish text | `fe55ca3` |
+| v2.7.2 | Structured confidence evidence + `schema_version` in outcome history; ML decision-point doc; Rich terminal dashboard; ET-timestamped commentary events | `55f4c3e` … `5f5fb7e` |
 
 ## Current state (as of Oct 2026)
 
-- **1390 tests** on the developer's machine; all pass except
+- **1437 tests** on the developer's machine; all pass except
   `test_package_market_session_differs_from_phase`, which is wall-clock
   dependent and fails outside trading hours — not a real bug
 - Live Alpaca data works. Session transitions work. All engines integrated.
 - Outcome tracker is recording and resolving observations in live sessions.
-- **v2.7 is complete.** No next version has been approved yet.
+- **v2.7 is complete** (latest tag `v2.7.2`). No next version has been approved yet.
 
 ## v2.7 — Single authoritative confidence (COMPLETE)
 
@@ -133,7 +135,7 @@ sees outcomes resolved that tick). Every consumer reads the stored value:
 | `confidence_engine.build_thesis*/build_compact_thesis*` (mock commentary) | `package["confidence"]` | own structural computation |
 | `ai/claude_client` startup briefing | stored calibration explanation | recalibrates (packages built outside the cycle) |
 | `ai/prompt_builder` THESIS CONFIDENCE section (real Claude) | `package["confidence"]` | section omitted |
-| `cli/dashboard` Final Conviction / Historical Adjustment | `ConfidenceState` | lines omitted |
+| `cli/dashboard` CONVICTION panel (Final Conviction / Historical Adjustment) | `ConfidenceState` | panel shows "No confidence computed yet" |
 | `memory/outcome_tracker` via `commentary_cycle` | **structural** (+ calibrated for audit) | snapshot score |
 
 If the pipeline fails it logs a warning and sets `confidence_state = None`
@@ -181,6 +183,51 @@ See **[docs/ML_DECISION_POINT.md](docs/ML_DECISION_POINT.md)**.
   the reasoner instead of the explainer. If asked, point to the doc and its
   checklist.
 
+## Terminal dashboard (`cli/dashboard.py`, Rich)
+
+Two entry points with the same signature:
+- `render_dashboard_rich(...)` → Rich renderable. `runtime_loop._render_dashboard()`
+  redraws it in place with `console.clear()` + `console.print()` (no `Live`).
+- `render_dashboard(...)` → the same layout exported as plain text
+  (`Console(record=True, color_system=None, width=100)`). Tests assert on this.
+
+Layout: top bar (`R2 · SPY · [DATA:…] · [SESSION] · HH:MM:SS ET`); left 60%
+MARKET / STATUS / WARNINGS (always shown, "No active warnings" when empty) /
+ACTIVE TRADE (if open); right 40% CONVICTION (Final Conviction in 3-row block
+digits) / SETUP SCORE / ACTIVE PATTERNS (each only when present); bottom
+RECENT EVENTS, newest first, max 6, two rows each ending in "…".
+
+- **Layout is sized to content.** `_Dashboard` measures each region at the
+  width the Layout assigns and sizes the Layout to fit, so a short terminal
+  never clips panels and a tall one is not padded. Don't replace this with a
+  bare `Layout` (it fills/clips to terminal height).
+- **Build text with `Text` objects, not markup strings** — values like
+  `[DATA:LIVE]` and `[regime_change]` would otherwise be parsed as style tags.
+- **Conviction lines use `_Chunks`**, which wraps only between whole pieces,
+  so "Final Conviction 63%" stays together on narrow terminals.
+- **Color rules:** direction/regime green bull · red bear · yellow chop;
+  confidence red <40 · yellow 40–59 · green ≥60 (`confidence_style`); entries
+  green ✓ / red ✗; price green above VWAP · red below; session green
+  open/midday/power_hour · yellow premarket/after_hours · dim closed.
+- The plain-text helpers at the bottom of the file (`_render_header`,
+  `_render_market_status`, `_render_readiness`, `_render_events_section`,
+  `render_*_line`, `_score_bar`) predate Rich and are kept, unchanged, for
+  tests and callers that use them directly. The Rich layout does not use them.
+- **Event log format:** `RuntimeState.add_event()` writes
+  `"HH:MM:SS  msg"` in **Eastern time** (same clock as the top bar) and keeps
+  the last `max_events` (12). AI commentary goes through it as
+  `"HH:MM:SS  AI [trigger]: text"`; `dashboard.parse_event()` splits these.
+- Latest commentary is shown only in RECENT EVENTS — it is not printed a
+  second time below the dashboard.
+
+Preview without running the loop:
+```bash
+PYTHONPATH=. python -c "from runtime.update_cycle import run_update_cycle; from runtime.runtime_state import RuntimeState; from cli.dashboard import render_dashboard_rich; from rich.console import Console; s=RuntimeState(); run_update_cycle(s); Console().print(render_dashboard_rich(state=s.market_state, score=s.setup_score, context_state=s.context_state, session_memory=s.session_memory, active_patterns=[], recent_events=s.recent_events, confidence_state=s.confidence_state))"
+```
+
+Tests: `tests/test_dashboard_rich.py` (layout, colors, events panel, narrow
+widths, timestamps, runtime_loop redraw).
+
 ## Working conventions — follow these strictly
 
 1. **Audit before editing.** Read the actual file before proposing any change.
@@ -191,8 +238,10 @@ See **[docs/ML_DECISION_POINT.md](docs/ML_DECISION_POINT.md)**.
 4. **Protected files — do not modify without explicit instruction:**
    - `engine/alpaca_feed.py` (live data — working, fragile)
    - `runtime/runtime_loop.py`, `runtime/run_r2.py`, `runtime/scheduler.py`
-     (v2.7 added one approved line to `runtime_loop._render_dashboard`)
-   - `cli/dashboard.py`
+     (approved changes so far: v2.7 passed `confidence_state` to the dashboard;
+     v2.7.2 switched `_render_dashboard` to the Rich clear-and-print redraw)
+   - `cli/dashboard.py` (rewritten with Rich in v2.7.2 under explicit approval;
+     protected again)
    - `strategy/*` and `context/*` (stable, not part of current work)
 5. **Never break the test count.** All existing tests must pass before
    adding new ones. If a change legitimately invalidates a test assertion,
@@ -211,7 +260,7 @@ See **[docs/ML_DECISION_POINT.md](docs/ML_DECISION_POINT.md)**.
 ## Running R2
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt      # includes rich (dashboard)
 
 # Demo mode (synthetic data, mock AI) — safe, no keys needed
 python -m runtime.run_r2
@@ -262,6 +311,10 @@ Set `--log-level DEBUG` and grep for:
 
 If the dashboard's Final Conviction differs from the startup briefing: expected.
 The briefing is a session-open snapshot — check its `[Generated … cycle N]` line.
+
+If commentary seems missing from the dashboard: it is in RECENT EVENTS
+(newest first, two rows each). It is no longer printed separately below.
+Event times are ET; anything logged before v2.7.2 used UTC.
 
 If commentary seems stale: that's usually event intelligence correctly
 suppressing a non-material change. Check `[event] Suppressed` lines before
