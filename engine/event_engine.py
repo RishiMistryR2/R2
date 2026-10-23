@@ -291,8 +291,17 @@ def _build(state, trigger: str) -> MarketSnapshot:
             if ind_5m:
                 atr_5m = getattr(ind_5m, "atr", None)
 
-    # Confidence
-    cr = compute_confidence(fields, regime_name, regime_conf, sess_key, entries)
+    # Confidence — v2.7: read the single authoritative value computed once
+    # per update cycle (calibrated = Final Conviction).  Fall back to a
+    # direct computation only when no stored value exists: before the first
+    # cycle, or when the confidence pipeline failed this cycle.
+    cs = getattr(state, "confidence_state", None)
+    if cs is not None:
+        confidence_score = float(cs.calibrated_confidence)
+    else:
+        confidence_score = float(
+            compute_confidence(fields, regime_name, regime_conf, sess_key, entries).score
+        )
 
     # Patterns
     patterns      = classify_patterns(fields, regime=regime_name, session=sess_key)
@@ -314,7 +323,7 @@ def _build(state, trigger: str) -> MarketSnapshot:
         missing_confirmation = (fields.get("missing_confirmation") or "").strip(),
         regime_name          = regime_name,
         regime_conf          = float(regime_conf),
-        confidence_score     = float(cr.score),
+        confidence_score     = confidence_score,
         pattern_names        = pattern_names,
         timestamp            = datetime.now(tz=timezone.utc),
         trigger              = trigger,

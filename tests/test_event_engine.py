@@ -644,6 +644,40 @@ def test_build_snapshot_blank_state_no_crash():
     assert snap is not None
 
 
+def test_build_snapshot_reads_stored_calibrated_confidence():
+    # v2.7: snapshot uses the cycle's ConfidenceState, not a recompute.
+    from engine.event_engine import build_snapshot
+    from memory.outcome_tracker import reset_tracker
+    from runtime.update_cycle import run_update_cycle, reset_engine
+    from runtime.runtime_state import RuntimeState
+    reset_tracker(":memory:")
+    reset_engine()
+    state = RuntimeState()
+    run_update_cycle(state)
+    state.confidence_state.calibrated_confidence = 77.7
+    assert build_snapshot(state, "regime_change").confidence_score == 77.7
+
+
+def test_build_snapshot_falls_back_when_no_confidence_state():
+    from engine.event_engine import build_snapshot
+    from engine.confidence_engine import compute_confidence
+    from engine.narrative_engine import _to_fields, _session_key
+    from memory.outcome_tracker import reset_tracker
+    from runtime.update_cycle import run_update_cycle, reset_engine
+    from runtime.runtime_state import RuntimeState
+    reset_tracker(":memory:")
+    reset_engine()
+    state = RuntimeState()
+    run_update_cycle(state)
+    state.confidence_state = None
+    reg = state.market_state.regime
+    expected = compute_confidence(
+        _to_fields(state.structure_state), reg.regime.value,
+        float(reg.confidence), _session_key(state.market_state.market_session),
+    ).score
+    assert build_snapshot(state, "regime_change").confidence_score == float(expected)
+
+
 def test_build_snapshot_has_atr_after_update():
     """After a full update cycle, ATR should be populated."""
     from engine.event_engine import build_snapshot
