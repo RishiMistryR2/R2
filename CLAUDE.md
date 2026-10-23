@@ -106,6 +106,7 @@ where the confidence pipeline failed); old JSON must keep loading.
 | v2.7 | Single authoritative ConfidenceState (steps 1–15) | `4dd33c8` … `8fa99ab` |
 | v2.7.1 | Fix: `trend_bear` fallback narrative produced bullish text | `fe55ca3` |
 | v2.7.2 | Structured confidence evidence + `schema_version` in outcome history; ML decision-point doc; Rich terminal dashboard; ET-timestamped commentary events | `55f4c3e` … `5f5fb7e` |
+| v2.8 | Event journal — append-only JSONL of every event-intelligence decision (spoken and suppressed), per ET day | `7071f46` |
 
 ## Current state (as of Oct 2026)
 
