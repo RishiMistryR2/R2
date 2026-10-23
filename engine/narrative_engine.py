@@ -576,19 +576,21 @@ def _minimal_fallback(
             )
         )
 
-    elif "bull" in regime_clean or "trend" in regime_clean:
-        base = (
-            f"{sess_pfx}{symbol} is in a {regime_clean} regime. "
-            "Structural confirmation is still loading — "
-            + _trend_watch(bull=True)
-        )
-        body = base + (" " + lv if lv else "")
-
+    # Bear must be checked before bull: "trend bear" also contains "trend",
+    # which the bull branch accepts as a catch-all for undirected trends.
     elif "bear" in regime_clean:
         base = (
             f"{sess_pfx}{symbol} is in a {regime_clean} regime. "
             "Structural confirmation is still loading — "
             + _trend_watch(bull=False)
+        )
+        body = base + (" " + lv if lv else "")
+
+    elif "bull" in regime_clean or "trend" in regime_clean:
+        base = (
+            f"{sess_pfx}{symbol} is in a {regime_clean} regime. "
+            "Structural confirmation is still loading — "
+            + _trend_watch(bull=True)
         )
         body = base + (" " + lv if lv else "")
 

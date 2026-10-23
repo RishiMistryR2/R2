@@ -581,6 +581,41 @@ def test_minimal_fallback_trend_bull_mentions_specific_level():
     assert len(prices) >= 1, f"Trend bull fallback with levels must mention a price:\n{text}"
 
 
+def test_minimal_fallback_trend_bear_is_bearish():
+    """
+    Regression: "trend_bear" contains "trend", and the bull branch used to
+    match it first, producing bullish text for a bearish regime.
+    """
+    from engine.narrative_engine import build_narrative
+    kl = {
+        "session_high":   738.39,
+        "session_low":    730.50,
+        "vwap":           734.90,
+        "prior_day_high": 741.00,
+        "prior_day_low":  728.00,
+        "nearest_support": None,
+        "nearest_resistance": None,
+    }
+    struct_no_dir = {"key_levels": kl, "direction": "", "market_state": "range"}
+    for levels in (struct_no_dir, None):
+        text = build_narrative(levels, regime="trend_bear", session="open",
+                               entries_allowed=True)
+        assert "lower highs and lower lows" in text, (
+            f"trend_bear fallback must be bearish:\n{text}"
+        )
+        assert "higher highs and higher lows" not in text, (
+            f"trend_bear fallback must not contain bullish watch text:\n{text}"
+        )
+
+
+def test_minimal_fallback_trend_bull_still_bullish():
+    from engine.narrative_engine import build_narrative
+    text = build_narrative(None, regime="trend_bull", session="open",
+                           entries_allowed=True)
+    assert "higher highs and higher lows" in text
+    assert "lower highs and lower lows" not in text
+
+
 def test_uptrend_confirmation_and_invalidation_have_different_levels():
     """Confirmation and invalidation must reference different price levels."""
     from engine.narrative_engine import build_narrative
