@@ -233,8 +233,15 @@ def generate_commentary(
                         "market_session", None,
                     )
                     _session = _ms_obj.value if _ms_obj else ""
+                    # v2.7: history stores the structural score; the
+                    # calibrated value is kept alongside for audit only.
+                    _conf = getattr(state, "confidence_state", None)
                     get_tracker().record_observation(
                         _cs, _patterns, session=_session,
+                        structural_confidence=getattr(
+                            _conf, "structural_confidence", None),
+                        calibrated_confidence=getattr(
+                            _conf, "calibrated_confidence", None),
                     )
         except Exception as _ot_err:
             logger.debug(

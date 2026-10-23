@@ -258,7 +258,9 @@ class PatternObservation:
     direction:        str    # "uptrend" | "downtrend" | "ranging" | ""
     market_state:     str    # "trend" | "pullback" | "range" | …
     sequence:         str    # "HH HL HH HL" | "LH LL LH LL" | ""
-    confidence_score: float
+    confidence_score: float  # v2.7: structural thesis score — calibration
+                             # buckets compare against this, so it must
+                             # never include a historical adjustment
     pattern_names:    list   # list[str] — all active patterns at recording
     prediction:       str    # "bullish" | "bearish" | "neutral"
 
@@ -279,6 +281,9 @@ class PatternObservation:
     # ── Running price trackers ────────────────────────────────
     price_high_seen: Optional[float] = None
     price_low_seen:  Optional[float] = None
+
+    # ── v2.7: Final Conviction at record time (audit/display only) ──
+    calibrated_confidence: Optional[float] = None
 
     @property
     def elapsed_minutes(self) -> float:
@@ -396,6 +401,8 @@ class OutcomeTracker:
         patterns:  list,    # list[PatternMatch] or list[dict]
         session:   str = "",
         symbol:    str = "SPY",
+        structural_confidence: Optional[float] = None,
+        calibrated_confidence: Optional[float] = None,
     ) -> str:
         """
         Record a new structural observation.
@@ -404,6 +411,12 @@ class OutcomeTracker:
         MarketSnapshot from event_engine) or a plain dict.
         patterns may be PatternMatch objects (from pattern_engine) or plain
         dicts with a 'name' and 'bias' key.
+
+        v2.7: structural_confidence, when given, is stored as
+        confidence_score in place of the snapshot's value (the snapshot
+        carries the calibrated Final Conviction).  Recording the calibrated
+        value would feed past calibration back into future calibration.
+        calibrated_confidence is stored alongside for audit.
 
         Returns the new observation ID.
         """
@@ -427,6 +440,9 @@ class OutcomeTracker:
 
         p0 = _g("current_price")
 
+        conf = (structural_confidence if structural_confidence is not None
+                else _g("confidence_score", 35.0))
+
         obs = PatternObservation(
             obs_id           = str(uuid.uuid4())[:12],
             recorded_at      = datetime.now(tz=timezone.utc).isoformat(),
@@ -437,7 +453,7 @@ class OutcomeTracker:
             direction        = str(_g("direction", "")),
             market_state     = str(_g("market_state", "")),
             sequence         = str(_g("sequence", "")),
-            confidence_score = float(_g("confidence_score", 35.0) or 35.0),
+            confidence_score = float(conf or 35.0),
             pattern_names    = pattern_names,
             prediction       = prediction,
             session_high     = _g("session_high"),
@@ -446,6 +462,9 @@ class OutcomeTracker:
             atr_at_record    = _g("atr_5m"),
             price_high_seen  = p0,
             price_low_seen   = p0,
+            calibrated_confidence = (float(calibrated_confidence)
+                                     if calibrated_confidence is not None
+                                     else None),
         )
 
         self._obs[obs.obs_id] = obs

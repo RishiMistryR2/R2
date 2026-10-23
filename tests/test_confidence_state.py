@@ -359,6 +359,33 @@ def test_startup_briefing_does_not_recalibrate():
 
 
 # ──────────────────────────────────────────────────────────────
+# Outcome history records structural (step 11)
+# ──────────────────────────────────────────────────────────────
+
+def test_commentary_records_structural_not_calibrated():
+    import runtime.commentary_cycle as cc
+    from engine.event_engine import EventIntelligenceResult
+    state, tracker = _cycled()
+    state.mock_ai = True
+    cs = state.confidence_state
+    cs.calibrated_confidence = cs.structural_confidence + 9.0
+    approved = EventIntelligenceResult(
+        priority="important", score=50.0, changes=[], suppress=False,
+        change_summary="", trigger="regime_change",
+    )
+    with mock.patch("engine.event_engine.evaluate_event", return_value=approved), \
+         mock.patch("engine.pattern_engine.classify_patterns",
+                    return_value=[_Pat("Test Pattern", "bullish")]), \
+         mock.patch("engine.pattern_engine.build_pattern_narrative_from_package",
+                    return_value=""):
+        cc.generate_commentary(state, trigger="regime_change")
+    recorded = tracker.recent_observations(n=5)
+    assert len(recorded) == 1
+    assert recorded[0].confidence_score      == cs.structural_confidence
+    assert recorded[0].calibrated_confidence == cs.calibrated_confidence
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 

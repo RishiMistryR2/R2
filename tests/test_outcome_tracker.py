@@ -1068,6 +1068,68 @@ def _make_obs(**kw) -> "PatternObservation":
     return PatternObservation(**base)
 
 
+# ══════════════════════════════════════════════════════════════
+# v2.7 — structural confidence in history, calibrated alongside
+# ══════════════════════════════════════════════════════════════
+
+def test_structural_confidence_overrides_snapshot_score():
+    from memory.outcome_tracker import OutcomeTracker
+    t   = OutcomeTracker(path=":memory:")
+    oid = t.record_observation(_snap(confidence_score=72.0), [_pat("X")],
+                               structural_confidence=64.0,
+                               calibrated_confidence=72.0)
+    obs = t.get_observation(oid)
+    assert obs.confidence_score      == 64.0
+    assert obs.calibrated_confidence == 72.0
+
+
+def test_without_structural_uses_snapshot_score():
+    from memory.outcome_tracker import OutcomeTracker
+    t   = OutcomeTracker(path=":memory:")
+    oid = t.record_observation(_snap(confidence_score=54.0), [_pat("X")])
+    obs = t.get_observation(oid)
+    assert obs.confidence_score      == 54.0
+    assert obs.calibrated_confidence is None
+
+
+def test_calibrated_confidence_survives_save_load():
+    from memory.outcome_tracker import OutcomeTracker
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+        path = fh.name
+    try:
+        t1  = OutcomeTracker(path=path)
+        oid = t1.record_observation(_snap(), [_pat("X")],
+                                    structural_confidence=61.0,
+                                    calibrated_confidence=66.5)
+        t1.save()
+        obs = OutcomeTracker(path=path).get_observation(oid)
+        assert obs.confidence_score      == 61.0
+        assert obs.calibrated_confidence == 66.5
+    finally:
+        os.unlink(path)
+
+
+def test_pre_v27_json_loads_without_calibrated_field():
+    import json
+    from memory.outcome_tracker import OutcomeTracker
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+        path = fh.name
+    try:
+        t1  = OutcomeTracker(path=path)
+        oid = t1.record_observation(_snap(), [_pat("X")])
+        t1.save()
+        with open(path) as fh:
+            data = json.load(fh)
+        del data["observations"][oid]["calibrated_confidence"]
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+        obs = OutcomeTracker(path=path).get_observation(oid)
+        assert obs is not None
+        assert obs.calibrated_confidence is None
+    finally:
+        os.unlink(path)
+
+
 # ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
