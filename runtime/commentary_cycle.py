@@ -94,6 +94,8 @@ def generate_commentary(
     Returns the commentary string, or None if generation failed / fallback.
     Never raises.
     """
+    _event_result = None   # EventResult once evaluate_event() has run
+    _journaled    = False  # decision written to the event journal
     try:
         from ai.claude_client import (
             generate_startup_commentary,
@@ -105,7 +107,6 @@ def generate_commentary(
         # ── Event intelligence — runs BEFORE the package build ──────
         # Suppresses insignificant events with zero API cost.
         _current_snap = None
-        _event_result = None
 
         if trigger not in ("startup_briefing", "user_request"):
             try:
@@ -121,6 +122,7 @@ def generate_commentary(
                         f"score={_event_result.score:.0f}  "
                         f"priority={_event_result.priority}"
                     )
+                    _journal_decision(state, trigger, _event_result)
                     return None
 
                 # Rate-limit informational events
@@ -134,6 +136,8 @@ def generate_commentary(
                             f"[event] Informational rate-limited [{trigger}]  "
                             f"elapsed={elapsed:.0f}s  gap={_MIN_INFORMATIONAL_GAP:.0f}s"
                         )
+                        _journal_decision(state, trigger, _event_result,
+                                          rate_limited=True)
                         return None
 
                 logger.info(
@@ -199,12 +203,18 @@ def generate_commentary(
 
         if result.is_fallback:
             logger.info(f"[commentary] Fallback ({trigger}): {result.text[:60]}")
+            if _event_result is not None:
+                _journaled = True
+                _journal_decision(state, trigger, _event_result)
             return None
 
         text = result.text
         if trigger == TRIGGER_STARTUP:
             text = _stamp_briefing(text, state)
         _commit_commentary(state, text, trigger)
+        if _event_result is not None:
+            _journaled = True
+            _journal_decision(state, trigger, _event_result, commentary=text)
 
         # Advance event intelligence state only after successful commentary.
         if _current_snap is not None:
@@ -262,6 +272,9 @@ def generate_commentary(
 
     except Exception as e:
         logger.error(f"[commentary] Generation error ({trigger}): {e}", exc_info=True)
+        # Approved by event intelligence but commentary failed — still journal it.
+        if _event_result is not None and not _journaled:
+            _journal_decision(state, trigger, _event_result)
         return None
 
 
@@ -371,6 +384,32 @@ def _stamp_briefing(text: str, state: RuntimeState) -> str:
     except Exception as e:
         logger.warning(f"[commentary] Briefing timestamp failed (non-fatal): {e}")
         return text
+
+
+def _journal_decision(
+    state:        RuntimeState,
+    trigger:      str,
+    event_result: object,
+    *,
+    rate_limited: bool = False,
+    commentary:   Optional[str] = None,
+) -> None:
+    """
+    Append one event-intelligence decision to the daily event journal
+    (memory/event_journal.py). Non-fatal: failures log a warning.
+    """
+    try:
+        from memory.event_journal import record_decision
+        record_decision(
+            event_result,
+            cycle            = getattr(state, "update_count", 0),
+            trigger          = trigger,
+            confidence_state = getattr(state, "confidence_state", None),
+            rate_limited     = rate_limited,
+            commentary       = commentary,
+        )
+    except Exception as e:
+        logger.warning(f"[journal] decision not recorded (non-fatal): {e}")
 
 
 def _commit_commentary(state: RuntimeState, text: str, trigger: str) -> None:
