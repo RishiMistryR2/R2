@@ -110,9 +110,9 @@ where the confidence pipeline failed); old JSON must keep loading.
 
 ## Current state (as of Oct 2026)
 
-- **1456 tests** on the developer's machine; all pass except
-  `test_package_market_session_differs_from_phase`, which is wall-clock
-  dependent and fails outside trading hours — not a real bug
+- **1456 tests**, all passing at any time of day. Tests must not depend on
+  the wall clock: pin session phase / market session explicitly on demo
+  state (see `test_package_market_session_differs_from_phase`)
 - Live Alpaca data works. Session transitions work. All engines integrated.
 - Outcome tracker is recording and resolving observations in live sessions.
 - **v2.7 is complete.** Run `git tag --sort=-v:refname | head -1` for the latest
