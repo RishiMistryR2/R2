@@ -32,12 +32,29 @@ Used by
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    # Type-only import: keeps engine/ free of a runtime dependency on memory/.
+    from memory.statistical_intelligence import CalibrationResult
 
 
 # ──────────────────────────────────────────────────────────────
-# Result type
+# Result types
 # ──────────────────────────────────────────────────────────────
+
+@dataclass
+class ConfidenceState:
+    """Authoritative confidence values computed once per update cycle."""
+
+    structural_confidence: float
+    calibrated_confidence: float
+    regime_confidence: float
+    calibration_result: Optional["CalibrationResult"]
+    computed_at: datetime
+    source_cycle: int
+
 
 @dataclass
 class ConfidenceResult:
@@ -265,11 +282,17 @@ def compute_confidence(
         contradicting.append(sess_note)
 
     # ── 11. Entries permitted ──────────────────────────────────
-    if not entries_allowed:
-        score -= 5
-        contradicting.append("Entries not currently permitted in this session.")
-    elif direction in ("uptrend", "downtrend"):
-        supporting.append("Session permits entries — setup can be acted upon.")
+    # Entry readiness is an action filter, not evidence about directional
+    # thesis strength.  Whether entries are permitted or prohibited tells us
+    # nothing about whether the structural thesis is correct — it only tells
+    # us whether we are allowed to act on it right now.
+    #
+    # entries_allowed is intentionally kept as a parameter for backward
+    # compatibility with existing callers, but it no longer affects the
+    # confidence score in either direction.
+    #
+    # The dashboard displays entry readiness separately under its own label
+    # ("Entry readiness: Disabled") rather than folding it into this score.
 
     # ── Clamp ──────────────────────────────────────────────────
     score = max(15.0, min(90.0, score))

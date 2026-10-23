@@ -223,17 +223,101 @@ def test_closed_lower_than_after_hours():
 # Entries allowed
 # ──────────────────────────────────────────────────────────────
 
-def test_entries_not_allowed_lowers_score():
+# v2.7: entry readiness is an action filter, not directional evidence.
+# compute_confidence() keeps the entries_allowed parameter for backward
+# compatibility but no longer lets it change the score or evidence lists.
+
+def test_entries_not_allowed_does_not_change_score():
+    # Was test_entries_not_allowed_lowers_score — v2.7 removed the −5 penalty.
     from engine.confidence_engine import compute_confidence
     cr_yes = compute_confidence(_uptrend(), entries_allowed=True,  session_key="open")
     cr_no  = compute_confidence(_uptrend(), entries_allowed=False, session_key="open")
-    assert cr_no.score < cr_yes.score
+    assert cr_no.score == cr_yes.score
 
 
-def test_entries_not_allowed_in_contradicting():
+def test_entries_not_allowed_not_in_contradicting():
+    # Was test_entries_not_allowed_in_contradicting — v2.7 removed that item.
     from engine.confidence_engine import compute_confidence
     cr = compute_confidence(_uptrend(), entries_allowed=False)
-    assert any("not" in s.lower() and "permit" in s.lower() for s in cr.contradicting)
+    assert not any("permit" in s.lower() for s in cr.contradicting)
+
+
+def test_entries_flag_no_effect_across_directions_and_sessions():
+    from engine.confidence_engine import compute_confidence
+    for fields in (_uptrend(), _downtrend(), _range()):
+        for sess in ("premarket", "open", "midday", "power_hour", "after_hours", "closed"):
+            cr_yes = compute_confidence(fields, entries_allowed=True,  session_key=sess)
+            cr_no  = compute_confidence(fields, entries_allowed=False, session_key=sess)
+            assert cr_yes.score == cr_no.score, f"{fields['direction']}/{sess}"
+            assert cr_yes.label == cr_no.label
+            assert cr_yes.supporting == cr_no.supporting
+            assert cr_yes.contradicting == cr_no.contradicting
+
+
+def test_entries_permission_not_in_supporting():
+    from engine.confidence_engine import compute_confidence
+    for fields in (_uptrend(), _downtrend()):
+        cr = compute_confidence(fields, entries_allowed=True, session_key="open")
+        assert not any("permit" in s.lower() for s in cr.supporting)
+
+
+# ──────────────────────────────────────────────────────────────
+# ConfidenceState (v2.7)
+# ──────────────────────────────────────────────────────────────
+
+def test_confidence_state_holds_all_fields():
+    from datetime import datetime, timezone
+    from engine.confidence_engine import ConfidenceState
+    now = datetime(2026, 10, 22, 14, 30, tzinfo=timezone.utc)
+    cs = ConfidenceState(
+        structural_confidence=69.0,
+        calibrated_confidence=72.5,
+        regime_confidence=0.75,
+        calibration_result=None,
+        computed_at=now,
+        source_cycle=42,
+    )
+    assert cs.structural_confidence == 69.0
+    assert cs.calibrated_confidence == 72.5
+    assert cs.regime_confidence == 0.75
+    assert cs.calibration_result is None
+    assert cs.computed_at == now
+    assert cs.source_cycle == 42
+
+
+def test_confidence_state_accepts_calibration_result():
+    from datetime import datetime
+    from engine.confidence_engine import ConfidenceState
+    from memory.statistical_intelligence import CalibrationResult
+    cal = CalibrationResult(
+        base_confidence=69.0, final_confidence=72.5, adjustment=3.5,
+        sufficient_history=True, win_rate=0.62, sample_size=30,
+        explanation="Historical win rate 62% over 30 observations.",
+    )
+    cs = ConfidenceState(
+        structural_confidence=cal.base_confidence,
+        calibrated_confidence=cal.final_confidence,
+        regime_confidence=0.75,
+        calibration_result=cal,
+        computed_at=datetime.now(),
+        source_cycle=1,
+    )
+    assert cs.calibration_result is cal
+    assert cs.calibrated_confidence - cs.structural_confidence == cal.adjustment
+
+
+def test_confidence_engine_does_not_import_memory_at_runtime():
+    # The CalibrationResult annotation is type-only; engine/ must not pull
+    # memory/ in at import time.
+    # Runs in a fresh interpreter so it can't disturb other tests' modules.
+    import subprocess, sys as _sys
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    code = (
+        "import sys; import engine.confidence_engine; "
+        "sys.exit(1 if 'memory.statistical_intelligence' in sys.modules else 0)"
+    )
+    result = subprocess.run([_sys.executable, "-c", code], cwd=root)
+    assert result.returncode == 0, "engine.confidence_engine imported memory/ at runtime"
 
 
 # ──────────────────────────────────────────────────────────────
