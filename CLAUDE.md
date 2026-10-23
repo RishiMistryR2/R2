@@ -270,7 +270,9 @@ widths, timestamps, runtime_loop redraw).
    - `engine/alpaca_feed.py` (live data — working, fragile)
    - `runtime/runtime_loop.py`, `runtime/run_r2.py`, `runtime/scheduler.py`
      (approved changes so far: v2.7 passed `confidence_state` to the dashboard;
-     v2.7.2 switched `_render_dashboard` to the Rich clear-and-print redraw)
+     v2.7.2 switched `_render_dashboard` to the Rich clear-and-print redraw;
+     `run_r2._configure_logging` applies `--log-level` and, at DEBUG, writes
+     logs/r2.log)
    - `cli/dashboard.py` (rewritten with Rich in v2.7.2 under explicit approval;
      protected again)
    - `strategy/*` and `context/*` (stable, not part of current work)
@@ -306,7 +308,7 @@ python -m runtime.run_r2 --live --no-mock-ai
 --interval 30        # seconds between update cycles
 --interactive        # blocking terminal REPL
 --no-dashboard       # suppress dashboard
---log-level DEBUG    # verbose; shows [structure-debug] and [event] lines
+--log-level DEBUG    # verbose; full stream from every module also saved to logs/r2.log
 ```
 
 ## Running tests
@@ -333,12 +335,22 @@ Most test files have a `__main__` block so they run without pytest too.
 
 ## Debugging live behavior
 
-Set `--log-level DEBUG` and grep for:
+Set `--log-level DEBUG`. Every module's output is appended to `logs/r2.log`
+(regardless of `LOG_TO_FILE`; third-party libraries held at WARNING; never
+rotated — clear it between sessions if size matters). Grep it for:
 - `[structure-debug]` — what structure data reached commentary
 - `[event]` — suppression / approval decisions with scores
 - `[outcome]` — observation recording and resolution
 - `[commentary]` — generation and fallback events
 - `[confidence]` — per-cycle structural/calibrated scores and calibration explanation
+
+Logging, as set up by `run_r2._configure_logging`:
+- The root logger level comes from `--log-level` (before `b05e7f8` it was never
+  applied, so everything ran at WARNING).
+- Each run also writes `logs/runtime/r2_<timestamp>.log` (`runtime.*` loggers only).
+- Without DEBUG there is no root handler, so warnings print to stderr. With
+  DEBUG they go to the files instead and don't overwrite the dashboard.
+- `LOG_TO_FILE` / `config/logging_setup.py` are not used by `run_r2`.
 
 If the dashboard's Final Conviction differs from the startup briefing: expected.
 The briefing is a session-open snapshot — check its `[Generated … cycle N]` line.
