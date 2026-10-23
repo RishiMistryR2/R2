@@ -245,6 +245,17 @@ def _configure_logging(level: str = "INFO") -> None:
             logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s")
         )
         logging.getLogger("runtime").addHandler(fh)
+        logging.getLogger().setLevel(level)
+        if level.upper() == "DEBUG":
+            # Full debug stream from every module → logs/r2.log, regardless of LOG_TO_FILE.
+            from config.settings import LOG_FILE
+            dbg = logging.FileHandler(LOG_FILE, encoding="utf-8")
+            dbg.setFormatter(fh.formatter)
+            logging.getLogger().addHandler(dbg)
+            for noisy in ("websockets", "aiohttp", "urllib3", "asyncio",
+                          "httpcore", "httpx", "anthropic"):
+                logging.getLogger(noisy).setLevel(logging.WARNING)
+            logger.info(f"[startup] Debug log: {LOG_FILE}")
         logger.info(f"[startup] Runtime log: {log_file}")
     except Exception as e:
         logging.basicConfig(level=level)
