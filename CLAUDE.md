@@ -30,6 +30,8 @@ Structure engine        engine/structure_engine.py     → StructureState (HH/HL
 Narrative engine        engine/narrative_engine.py     → trader-quality prose from structure
        ↓
 Confidence engine       engine/confidence_engine.py    → evidence-based thesis score 15–90
+                                                          (computed ONCE per cycle into
+                                                          RuntimeState.confidence_state — see v2.7)
        ↓
 Pattern engine          engine/pattern_engine.py       → named patterns with base-rate statistics
        ↓
@@ -51,11 +53,11 @@ Statistical intelligence memory/statistical_intelligence.py → historical conte
 | Regime (chop/trend_bull/trend_bear) + regime confidence | `strategy/regime_engine.py` | `MarketState.regime` |
 | HTF bias, setup score, entry signals | `strategy/strategy_engine.py` | `MarketState` |
 | Structure (direction, sequence, levels, events) | `engine/structure_engine.py` | `RuntimeState.structure_state` |
-| Structural thesis confidence | `engine/confidence_engine.py` | *(v2.7: `RuntimeState.confidence_state`)* |
+| Structural thesis confidence | `engine/confidence_engine.py` via `runtime/update_cycle._run_confidence_pipeline()` | `RuntimeState.confidence_state` |
 | Pattern classification | `engine/pattern_engine.py` | computed on demand |
 | Event significance + priority | `engine/event_engine.py` | `MarketSnapshot` |
 | Historical observations | `memory/outcome_tracker.py` | `~/.r2/outcome_tracker.json` |
-| Calibrated confidence | `memory/statistical_intelligence.py` | *(v2.7: `RuntimeState.confidence_state`)* |
+| Calibrated confidence (Final Conviction) | `memory/statistical_intelligence.py` via `runtime/update_cycle._run_confidence_pipeline()` | `RuntimeState.confidence_state` |
 
 ### Distinct concepts — never collapse these into one number
 
@@ -67,6 +69,12 @@ Statistical intelligence memory/statistical_intelligence.py → historical conte
 
 A market can be Trend Bear at 75% regime confidence, structural thesis 69%, and
 entries disabled after hours. That is not a contradiction.
+
+Outcome history (`PatternObservation.confidence_score`) stores **structural**
+confidence, never calibrated — calibration buckets compare against it, so
+storing calibrated values would feed past calibration back into future
+calibration. The calibrated value is kept alongside in
+`PatternObservation.calibrated_confidence` for audit only.
 
 ## Version history
 
@@ -81,77 +89,71 @@ entries disabled after hours. That is not a contradiction.
 | v2.3 | Pattern engine — named patterns with base rates | *(in pattern_engine)* |
 | v2.4 | Event intelligence — materiality scoring, duplicate suppression | `cba69ad` |
 | v2.5 | Outcome tracker — records events, resolves outcomes, strategy abstraction | *(in outcome_tracker)* |
-| v2.6 | Statistical intelligence — historical context, confidence calibration | `a5588b1` ← **current HEAD** |
-| **v2.7** | **Single authoritative ConfidenceState** — approved, NOT yet implemented | — |
+| v2.6 | Statistical intelligence — historical context, confidence calibration | `a5588b1` |
+| v2.7 | Single authoritative ConfidenceState (steps 1–15) | `4dd33c8` … `8fa99ab` |
 
 ## Current state (as of Oct 2026)
 
-- **1291 tests passing** on the developer's machine
-  (1 test, `test_package_market_session_differs_from_phase`, is wall-clock
-  dependent and may fail outside trading hours — not a real bug)
+- **1390 tests** on the developer's machine; all pass except
+  `test_package_market_session_differs_from_phase`, which is wall-clock
+  dependent and fails outside trading hours — not a real bug
 - Live Alpaca data works. Session transitions work. All engines integrated.
 - Outcome tracker is recording and resolving observations in live sessions.
-- **v2.7 is approved and the next thing to build.** See section below.
+- **v2.7 is complete.** No next version has been approved yet.
 
-## v2.7 — Single authoritative confidence (IN PROGRESS)
+## v2.7 — Single authoritative confidence (COMPLETE)
 
-### The problem
-`compute_confidence()` is currently called independently in 3+ places per
-event (event engine snapshot, startup briefing, mock commentary). Each call
-uses whatever state exists at that moment, so startup briefing, dashboard,
-commentary, and outcome records can show different confidence numbers for the
-same market state.
+### What it solved
+`compute_confidence()` used to be called independently by the event engine,
+startup briefing and mock commentary, so the briefing, dashboard, commentary
+and outcome records could show different numbers for the same market.
 
-### The fix
-Compute confidence **once per update cycle** in `update_cycle.py`, store it on
-`RuntimeState.confidence_state` as a `ConfidenceState` object, and make every
-consumer read that stored value. Nothing downstream recomputes.
+### How it works now
+Once per update cycle, `runtime/update_cycle._run_confidence_pipeline(state)`
+builds a `ConfidenceState` (in `engine/confidence_engine.py`) and stores it on
+`RuntimeState.confidence_state`. It runs after `mark_update()` (so
+`source_cycle == update_count`) and after outcome resolution (so calibration
+sees outcomes resolved that tick). Every consumer reads the stored value:
 
-### ConfidenceState (to be added to engine/confidence_engine.py)
-```python
-@dataclass
-class ConfidenceState:
-    structural_confidence:  float           # compute_confidence() with NO entries_allowed penalty
-    calibrated_confidence:  float           # after statistical_intelligence calibration
-    regime_confidence:      float           # from MarketState.regime.confidence
-    calibration_result:     Optional[CalibrationResult]
-    computed_at:            datetime
-    source_cycle:           int             # state.update_count
-```
+| Consumer | Reads | Fallback when `confidence_state` is None |
+|---|---|---|
+| `event_engine.build_snapshot()` | `calibrated_confidence` | `compute_confidence()` (permanent) |
+| `ai/state_packager` → `package["confidence"]` | all fields + calibration explanation | block omitted |
+| `confidence_engine.build_thesis*/build_compact_thesis*` (mock commentary) | `package["confidence"]` | own structural computation |
+| `ai/claude_client` startup briefing | stored calibration explanation | recalibrates (packages built outside the cycle) |
+| `ai/prompt_builder` THESIS CONFIDENCE section (real Claude) | `package["confidence"]` | section omitted |
+| `cli/dashboard` Final Conviction / Historical Adjustment | `ConfidenceState` | lines omitted |
+| `memory/outcome_tracker` via `commentary_cycle` | **structural** (+ calibrated for audit) | snapshot score |
 
-### Approved decisions
-- Remove the `entries_allowed` penalty from `compute_confidence()` (keep the
-  parameter for backward compat, just stop applying −5 and the contradicting item)
-- No new orchestration module — pipeline logic goes in `update_cycle.py` as
-  `_run_confidence_pipeline(state)`
-- `event_engine.build_snapshot()` keeps a permanent fallback to
-  `compute_confidence()` for when `confidence_state` is None
-- Dashboard shows **Final Conviction** (calibrated) and **Historical Adjustment**
-  (the delta), not two competing raw numbers
-- Startup briefing stays a session-open snapshot but gains a "generated at" timestamp
+If the pipeline fails it logs a warning and sets `confidence_state = None`
+(never leaves a value from an earlier cycle). If only calibration fails,
+calibrated = structural.
+
+### Decisions (approved)
+- `entries_allowed` no longer affects `compute_confidence()` (parameter kept)
+- Outcome history stores structural confidence, not calibrated (see "Distinct concepts")
+- Statistical intelligence excludes observations older than 30 days and halves
+  the adjustment when history's dominant outcome opposes current structure
+  direction (bullish history vs downtrend, bearish vs uptrend);
+  `CalibrationResult` exposes `raw_adjustment`, `conflict_dampened`,
+  `dampen_reason`, `age_filtered_count`
+- Thesis text shows the stored Final Conviction and spells out any
+  historical adjustment; evidence lists still come from the structural evaluation
+- Startup briefing commentary is a session-open snapshot, prefixed
+  `[Generated HH:MM:SS ET · confidence from cycle N — session-open snapshot]`
 - Old Recent Events keep their original confidence values — never rewritten
-- Statistical intelligence: exclude observations older than 30 days, dampen
-  calibration when history conflicts with current structure direction, expose
-  `raw_adjustment`, `conflict_dampened`, `dampen_reason`, `age_filtered_count`
-  on `CalibrationResult`
 
-### Implementation order (one file at a time, tests between each)
-```
- 1. engine/confidence_engine.py           PATCH  add ConfidenceState; remove entries penalty
- 2. tests/test_confidence_engine.py       TEST   update 2 entry-permission assertions; add 5 new
- 3. memory/statistical_intelligence.py    PATCH  staleness filter, conflict dampening, new fields
- 4. tests/test_statistical_intelligence.py TEST
- 5. runtime/runtime_state.py              PATCH  add confidence_state field
- 6. runtime/update_cycle.py               PATCH  add _run_confidence_pipeline(); call after structure commit
- 7. tests/test_confidence_state.py        TEST   NEW — unit tests for pipeline
- 8. engine/event_engine.py                PATCH  build_snapshot reads stored value, falls back
- 9. ai/state_packager.py                  PATCH  add package["confidence"] block
-10. ai/claude_client.py                   PATCH  read calibrated from package, no recompute
-11. memory/outcome_tracker.py             PATCH  one line — store calibrated_confidence
-12. cli/dashboard.py                      PATCH  Final Conviction / Historical Adjustment labels
-13. tests/test_confidence_integration.py  TEST   NEW — one shared value across all consumers
-```
-Step 1 is the next thing to do. Full regression (`pytest tests/`) after every step.
+### Known follow-ups (not approved, not done)
+- Promote `outcome_tracker._compute_stats` to public (imported privately by
+  `statistical_intelligence._pattern_stats_from`)
+- `statistical_intelligence.get_historical_context_from_package()` still calls
+  `compute_confidence()` for its bucket lookup (equals structural; only used
+  by the claude_client fallback path)
+- The claude_client fallback recalibration does not pass `structure_direction`
+
+Tests: `tests/test_confidence_state.py` (pipeline, packager, prompt, dashboard,
+briefing stamp) and `tests/test_confidence_integration.py` (one shared value
+across all consumers).
 
 ## Working conventions — follow these strictly
 
@@ -163,9 +165,10 @@ Step 1 is the next thing to do. Full regression (`pytest tests/`) after every st
 4. **Protected files — do not modify without explicit instruction:**
    - `engine/alpaca_feed.py` (live data — working, fragile)
    - `runtime/runtime_loop.py`, `runtime/run_r2.py`, `runtime/scheduler.py`
-   - `cli/dashboard.py` (only the explicitly planned v2.7 label change)
+     (v2.7 added one approved line to `runtime_loop._render_dashboard`)
+   - `cli/dashboard.py`
    - `strategy/*` and `context/*` (stable, not part of current work)
-5. **Never break the test count.** All 1291 existing tests must pass before
+5. **Never break the test count.** All existing tests must pass before
    adding new ones. If a change legitimately invalidates a test assertion,
    update that test explicitly and say why.
 6. **Non-fatal integration.** Anything added to `update_cycle.py` or
@@ -214,6 +217,8 @@ Most test files have a `__main__` block so they run without pytest too.
 
 - Confidence range: 15–90 (clamped)
 - Calibration: min 10 observations, full weight at 30, max ±15 points
+- Calibration staleness: observations older than 30 days excluded (`MAX_OBSERVATION_AGE_DAYS`)
+- Conflict dampening: adjustment × 0.5 when history opposes structure (`CONFLICT_DAMPEN_FACTOR`)
 - Event priority: critical ≥40, important 20–39, informational 5–19, suppressed <5
 - Informational events rate-limited to one per 5 minutes
 - Outcome tracker: rolling cap 500 observations, default timeout 120 min
@@ -227,6 +232,10 @@ Set `--log-level DEBUG` and grep for:
 - `[event]` — suppression / approval decisions with scores
 - `[outcome]` — observation recording and resolution
 - `[commentary]` — generation and fallback events
+- `[confidence]` — per-cycle structural/calibrated scores and calibration explanation
+
+If the dashboard's Final Conviction differs from the startup briefing: expected.
+The briefing is a session-open snapshot — check its `[Generated … cycle N]` line.
 
 If commentary seems stale: that's usually event intelligence correctly
 suppressing a non-material change. Check `[event] Suppressed` lines before
