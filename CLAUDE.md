@@ -38,6 +38,7 @@ Pattern engine          engine/pattern_engine.py       → named patterns with b
 Event intelligence      engine/event_engine.py         → "did anything materially change?" scoring
        ↓
 Commentary              runtime/commentary_cycle.py    → AI commentary via ai/claude_client.py
+                                                          (every event decision → memory/event_journal.py)
        ↓
 Outcome tracker         memory/outcome_tracker.py      → records events, resolves outcomes, MFE/MAE
        ↓
@@ -57,6 +58,7 @@ Statistical intelligence memory/statistical_intelligence.py → historical conte
 | Pattern classification | `engine/pattern_engine.py` | computed on demand |
 | Event significance + priority | `engine/event_engine.py` | `MarketSnapshot` |
 | Historical observations | `memory/outcome_tracker.py` | `~/.r2/outcome_tracker.json` |
+| Event-intelligence decisions (spoken and suppressed) | `memory/event_journal.py` via `commentary_cycle._journal_decision()` | `data/sessions/YYYY-MM-DD-events.jsonl` |
 | Calibrated confidence (Final Conviction) | `memory/statistical_intelligence.py` via `runtime/update_cycle._run_confidence_pipeline()` | `RuntimeState.confidence_state` |
 
 ### Distinct concepts — never collapse these into one number
@@ -107,7 +109,7 @@ where the confidence pipeline failed); old JSON must keep loading.
 
 ## Current state (as of Oct 2026)
 
-- **1437 tests** on the developer's machine; all pass except
+- **1456 tests** on the developer's machine; all pass except
   `test_package_market_session_differs_from_phase`, which is wall-clock
   dependent and fails outside trading hours — not a real bug
 - Live Alpaca data works. Session transitions work. All engines integrated.
@@ -183,6 +185,33 @@ See **[docs/ML_DECISION_POINT.md](docs/ML_DECISION_POINT.md)**.
   weights, scikit-learn or similar libraries, clustering, or using the LLM as
   the reasoner instead of the explainer. If asked, point to the doc and its
   checklist.
+
+## Event journal (`memory/event_journal.py`)
+
+Append-only JSONL record of every `evaluate_event()` decision, one file per
+ET trading day: `data/sessions/YYYY-MM-DD-events.jsonl` (`data/` is
+gitignored). Suppressed events matter most — they show what R2 chose not to say.
+
+Each line: `timestamp` (ISO UTC), `cycle`, `trigger`, `priority`, `score`,
+`suppressed`, `rate_limited`, `change_summary`, `change_keys`, `confidence`
+(`structural`, `calibrated`, `regime_confidence`, `source_cycle`, or `null`),
+`commentary_generated`, `commentary` (first 200 chars).
+
+- `generate_commentary` journals each decision **exactly once**, on every exit
+  path: suppressed; informational rate-limited (`suppressed` and
+  `rate_limited` both true); approved with commentary; approved but AI fell
+  back; approved then errored. If you add a new return path after
+  `evaluate_event()`, journal it too.
+- `startup_briefing` and `user_request` skip event intelligence, so they are
+  not journaled.
+- Writes append + flush under a lock and never raise (warning on failure).
+- Read: `load_session(date)` (skips a malformed line), `summarize_session(date)`.
+- CLI: `python -m memory.event_journal [YYYY-MM-DD]` (default today, ET).
+- `tests/conftest.py` redirects `JOURNAL_DIR` to a temp dir for every pytest
+  test so the suite never writes into a real day's journal. Standalone
+  runners don't load it — patch `memory.event_journal.JOURNAL_DIR` yourself.
+
+Tests: `tests/test_event_journal.py`.
 
 ## Terminal dashboard (`cli/dashboard.py`, Rich)
 
@@ -318,8 +347,8 @@ If commentary seems missing from the dashboard: it is in RECENT EVENTS
 Event times are ET; anything logged before v2.7.2 used UTC.
 
 If commentary seems stale: that's usually event intelligence correctly
-suppressing a non-material change. Check `[event] Suppressed` lines before
-assuming a bug.
+suppressing a non-material change. Check `[event] Suppressed` lines, or run
+`python -m memory.event_journal` and read that day's JSONL, before assuming a bug.
 
 If regime says Chop while structure says downtrend: that's expected hysteresis.
 Regime uses smoothed indicators and lags; structure uses raw swing points and
