@@ -44,12 +44,16 @@ Constants
   MAX_CALIBRATION_ADJUSTMENT   = 15.0  maximum pts of adjustment (±)
   CONFIDENCE_BUCKETS           = [(15,24),(25,34),(35,44),(45,54),
                                    (55,64),(65,74),(75,84),(85,90)]
+  MAX_OBSERVATION_AGE_DAYS     = 30    v2.7: older observations are excluded
+  CONFLICT_DAMPEN_FACTOR       = 0.5   v2.7: adjustment scale when history
+                                       opposes current structure direction
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger("memory.statistical_intelligence")
@@ -62,6 +66,15 @@ MIN_SAMPLE_SIZE            = 10
 CALIBRATION_FULL_WEIGHT_N  = 30
 MAX_CALIBRATION_ADJUSTMENT = 15.0
 _MAX_OBS                   = 500   # matches OutcomeTracker rolling cap
+
+# v2.7 — staleness filter: market behaviour from more than a month ago is
+# not reliable evidence about today's structure.
+MAX_OBSERVATION_AGE_DAYS   = 30
+
+# v2.7 — conflict dampening: when history leans the opposite way to the
+# current structure, live structure is the fresher evidence, so the
+# historical adjustment is scaled down by this factor.
+CONFLICT_DAMPEN_FACTOR     = 0.5
 
 # 8-point buckets across the 15–90 confidence range
 CONFIDENCE_BUCKETS: list[tuple[int, int]] = [
@@ -133,6 +146,7 @@ class HistoricalContext:
 
     # Meta
     has_sufficient_history: bool    # total_sample >= MIN_SAMPLE_SIZE
+    age_filtered_count:     int = 0 # v2.7: resolved obs excluded as stale
 
 
 @dataclass
@@ -149,6 +163,11 @@ class CalibrationResult:
     win_rate:           float   # historical rate that drove the adjustment
     sample_size:        int
     explanation:        str
+    # v2.7 — all defaulted for backward compatibility
+    raw_adjustment:     float = 0.0    # before conflict dampening
+    conflict_dampened:  bool  = False  # True when history opposed structure
+    dampen_reason:      str   = ""     # plain-English why, "" if not dampened
+    age_filtered_count: int   = 0      # resolved obs excluded as > 30 days old
 
 
 # ══════════════════════════════════════════════════════════════
@@ -171,6 +190,7 @@ def get_pattern_stats(
 def get_confidence_bucket_stats(
     confidence_score: float,
     tracker=None,
+    max_age_days:     Optional[int] = MAX_OBSERVATION_AGE_DAYS,
 ) -> Optional[ConfidenceBucketStats]:
     """
     Return statistics for all resolved observations whose confidence_score
@@ -184,7 +204,7 @@ def get_confidence_bucket_stats(
 
     b_low, b_high = bucket
     t             = _get_tracker(tracker)
-    all_obs       = t.recent_observations(n=_MAX_OBS)
+    all_obs, _    = _fresh_observations(t, max_age_days)
 
     bucket_obs = [
         o for o in all_obs
@@ -225,6 +245,7 @@ def get_confidence_bucket_stats(
 def get_directional_stats(
     prediction: str,
     tracker=None,
+    max_age_days: Optional[int] = MAX_OBSERVATION_AGE_DAYS,
 ) -> Optional[DirectionalStats]:
     """
     Return statistics for all observations that predicted the given direction
@@ -236,7 +257,7 @@ def get_directional_stats(
         return None
 
     t       = _get_tracker(tracker)
-    all_obs = t.recent_observations(n=_MAX_OBS)
+    all_obs, _ = _fresh_observations(t, max_age_days)
 
     obs = [
         o for o in all_obs
@@ -267,6 +288,7 @@ def get_historical_context(
     confidence_score: Optional[float] = None,
     prediction:       Optional[str]   = None,
     tracker=None,
+    max_age_days:     Optional[int]   = MAX_OBSERVATION_AGE_DAYS,
 ) -> HistoricalContext:
     """
     Build a HistoricalContext for the current market situation.
@@ -293,19 +315,24 @@ def get_historical_context(
 
     t = _get_tracker(tracker)
 
-    # ── Pattern stats ─────────────────────────────────────────
+    # ── Staleness filter (v2.7) ───────────────────────────────
+    fresh_obs, age_filtered = _fresh_observations(t, max_age_days)
+
+    # ── Pattern stats (fresh observations only) ───────────────
     matched = [
         s for name in snap_names
-        for s in [t.get_stats(name)]
+        for s in [_pattern_stats_from(name, fresh_obs)]
         if s is not None
     ]
 
     # ── Confidence bucket ─────────────────────────────────────
-    cb = (get_confidence_bucket_stats(effective_conf, tracker=t)
+    cb = (get_confidence_bucket_stats(effective_conf, tracker=t,
+                                      max_age_days=max_age_days)
           if effective_conf is not None else None)
 
     # ── Directional stats ─────────────────────────────────────
-    ds = (get_directional_stats(effective_pred, tracker=t)
+    ds = (get_directional_stats(effective_pred, tracker=t,
+                                max_age_days=max_age_days)
           if effective_pred and effective_pred != "neutral" else None)
 
     # ── Aggregate across matched patterns ─────────────────────
@@ -356,6 +383,7 @@ def get_historical_context(
         avg_mae_atr             = round(avg_mae, 2),
         avg_resolution_minutes  = round(avg_res, 1),
         has_sufficient_history  = total_sample >= MIN_SAMPLE_SIZE,
+        age_filtered_count      = age_filtered,
     )
 
 
@@ -416,8 +444,9 @@ def get_historical_context_from_package(
 
 
 def calibrate_confidence(
-    base_confidence: float,
-    context:         HistoricalContext,
+    base_confidence:     float,
+    context:             HistoricalContext,
+    structure_direction: Optional[str] = None,
 ) -> CalibrationResult:
     """
     Deterministically adjust base_confidence using historical win rate.
@@ -431,7 +460,14 @@ def calibrate_confidence(
     The chosen win_rate is:
       1. directional.win_rate  if directional sample_size >= MIN_SAMPLE_SIZE
       2. overall_accuracy      otherwise
+
+    v2.7 conflict dampening: if structure_direction is given and the
+    historical dominant outcome opposes it (bullish history vs downtrend,
+    bearish history vs uptrend), the adjustment is scaled by
+    CONFLICT_DAMPEN_FACTOR.  raw_adjustment keeps the undampened value.
     """
+    stale_note = _stale_note(context.age_filtered_count)
+
     if not context.has_sufficient_history:
         return CalibrationResult(
             base_confidence    = base_confidence,
@@ -443,8 +479,9 @@ def calibrate_confidence(
             explanation        = (
                 f"Insufficient history ({context.total_sample} obs, "
                 f"minimum {MIN_SAMPLE_SIZE} required). "
-                "Confidence unchanged."
+                "Confidence unchanged." + stale_note
             ),
+            age_filtered_count = context.age_filtered_count,
         )
 
     # Select the most specific win rate available
@@ -461,11 +498,19 @@ def calibrate_confidence(
     # Compute weighted adjustment
     weight     = min(sample_size / CALIBRATION_FULL_WEIGHT_N, 1.0)
     raw_adj    = (win_rate - 0.5) * 2.0 * MAX_CALIBRATION_ADJUSTMENT * weight
-    adjustment = max(-MAX_CALIBRATION_ADJUSTMENT,
+    raw_adj    = max(-MAX_CALIBRATION_ADJUSTMENT,
                      min(MAX_CALIBRATION_ADJUSTMENT, raw_adj))
+
+    # Conflict dampening (v2.7)
+    conflict, dampen_reason = _history_conflict(
+        context.dominant_outcome, structure_direction,
+    )
+    adjustment = raw_adj * CONFLICT_DAMPEN_FACTOR if conflict else raw_adj
+
     final      = max(15.0, min(90.0, base_confidence + adjustment))
     final      = round(final, 1)
     adjustment = round(adjustment, 1)
+    raw_adj    = round(raw_adj, 1)
 
     # Plain-English explanation
     if abs(adjustment) < 0.5:
@@ -489,6 +534,13 @@ def calibrate_confidence(
             f"to {final:.0f}% ({adjustment:.1f} pts)."
         )
 
+    if conflict:
+        explanation += (
+            f" {dampen_reason}, so the historical adjustment was reduced "
+            f"from {raw_adj:+.1f} to {adjustment:+.1f} pts."
+        )
+    explanation += stale_note
+
     return CalibrationResult(
         base_confidence    = base_confidence,
         final_confidence   = final,
@@ -497,6 +549,10 @@ def calibrate_confidence(
         win_rate           = win_rate,
         sample_size        = sample_size,
         explanation        = explanation,
+        raw_adjustment     = raw_adj,
+        conflict_dampened  = conflict,
+        dampen_reason      = dampen_reason,
+        age_filtered_count = context.age_filtered_count,
     )
 
 
@@ -576,6 +632,80 @@ def _bucket_for(confidence_score: float) -> Optional[tuple[int, int]]:
         if low <= confidence_score <= high:
             return (low, high)
     return None
+
+
+def _fresh_observations(tracker, max_age_days: Optional[int]) -> tuple[list, int]:
+    """
+    Return (observations recorded within max_age_days, number of resolved
+    observations excluded as stale).  max_age_days=None disables the filter.
+    Observations with an unreadable timestamp are kept: only observations
+    we can show are old get excluded.
+    """
+    all_obs = tracker.recent_observations(n=_MAX_OBS)
+    if max_age_days is None:
+        return all_obs, 0
+
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max_age_days)
+    fresh: list = []
+    stale = 0
+    for o in all_obs:
+        try:
+            rec = datetime.fromisoformat(o.recorded_at)
+            if rec.tzinfo is None:
+                rec = rec.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            fresh.append(o)
+            continue
+        if rec < cutoff:
+            if o.resolved:
+                stale += 1
+        else:
+            fresh.append(o)
+    return fresh, stale
+
+
+def _pattern_stats_from(pattern_name: str, observations: list):
+    """
+    PatternStats for one pattern over a given observation list.
+    Same aggregation as OutcomeTracker.get_stats(), but over the
+    age-filtered list instead of every stored observation.
+    """
+    # TODO(future version): promote _compute_stats to a public function in
+    # memory/outcome_tracker.py; importing a private helper across modules
+    # is a stopgap to avoid duplicating its aggregation logic here.
+    from memory.outcome_tracker import _compute_stats
+    named    = [o for o in observations if pattern_name in o.pattern_names]
+    resolved = [o for o in named if o.resolved]
+    if not resolved:
+        return None
+    return _compute_stats(pattern_name, resolved, len(named))
+
+
+_OPPOSING_HISTORY = {("bullish", "downtrend"), ("bearish", "uptrend")}
+
+
+def _history_conflict(
+    dominant_outcome:    Optional[str],
+    structure_direction: Optional[str],
+) -> tuple[bool, str]:
+    """True + plain-English reason when history opposes current structure."""
+    if (dominant_outcome, structure_direction) in _OPPOSING_HISTORY:
+        return True, (
+            f"Historically these setups mostly resolved {dominant_outcome}, "
+            f"but current structure is a {structure_direction}"
+        )
+    return False, ""
+
+
+def _stale_note(age_filtered_count: int) -> str:
+    """Explanation suffix noting how many stale observations were excluded."""
+    if age_filtered_count <= 0:
+        return ""
+    plural = "s" if age_filtered_count != 1 else ""
+    return (
+        f" {age_filtered_count} observation{plural} older than "
+        f"{MAX_OBSERVATION_AGE_DAYS} days excluded."
+    )
 
 
 def _weighted_avg(values: list[float], weights: list[float]) -> float:
