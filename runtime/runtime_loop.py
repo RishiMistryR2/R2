@@ -141,6 +141,7 @@ def _render_dashboard(state: RuntimeState) -> None:
                 if state.startup_briefing else []
             ),
             recent_events   = state.recent_events,
+            confidence_state = getattr(state, "confidence_state", None),
         )
         print(output, flush=True)
 

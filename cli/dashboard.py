@@ -45,6 +45,7 @@ def render_dashboard(
     active_patterns = None,
     recent_events:  List[str] = None,
     now:            Optional[datetime] = None,
+    confidence_state = None,   # v2.7: engine.confidence_engine.ConfidenceState
 ) -> str:
     if now is None:
         now = datetime.now(tz=timezone.utc)
@@ -52,6 +53,9 @@ def render_dashboard(
     sections: List[str] = []
     sections.append(_render_header(state, now))
     sections.append(_render_market_status(state, context_state))
+    conviction = _render_conviction(confidence_state)
+    if conviction:
+        sections.append(conviction)
     sections.append(_render_readiness(state, context_state))
 
     if score is not None:
@@ -157,6 +161,40 @@ def _render_market_status(state, context_state) -> str:
             )
 
     return "\n".join(lines)
+
+
+def _render_conviction(confidence_state) -> str:
+    """
+    v2.7 — Final Conviction (calibrated) and the Historical Adjustment that
+    produced it.  Regime confidence stays on the Regime line: different
+    concepts, never merged.  Empty string when no stored value exists.
+    """
+    if confidence_state is None:
+        return ""
+    try:
+        from engine.confidence_engine import _label_for
+        from memory.statistical_intelligence import MIN_SAMPLE_SIZE
+        final      = float(confidence_state.calibrated_confidence)
+        structural = float(confidence_state.structural_confidence)
+        label, _   = _label_for(final)
+        delta      = final - structural
+        cal        = confidence_state.calibration_result
+
+        if cal is not None and not cal.sufficient_history:
+            adj = f"none  · {cal.sample_size} obs, need {MIN_SAMPLE_SIZE}"
+        elif abs(delta) < 0.5:
+            adj = f"none  · structural {structural:.0f}%"
+        else:
+            adj = f"{delta:+.0f} pts  · structural {structural:.0f}%"
+        if cal is not None and getattr(cal, "conflict_dampened", False):
+            # Short to fit the 72-col box; the full reason is in the
+            # calibration explanation shown in commentary.
+            adj += "  · dampened"
+
+        return (f"  Final Conviction      : {final:.0f}%  ({label})\n"
+                f"  Historical Adjustment : {adj}")
+    except Exception:
+        return ""
 
 
 def _render_readiness(state, context_state) -> str:

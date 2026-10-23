@@ -386,6 +386,97 @@ def test_commentary_records_structural_not_calibrated():
 
 
 # ──────────────────────────────────────────────────────────────
+# Dashboard — Final Conviction / Historical Adjustment (step 12)
+# ──────────────────────────────────────────────────────────────
+
+def _cal(sufficient=True, n=30, dampened=False):
+    from memory.statistical_intelligence import CalibrationResult
+    return CalibrationResult(
+        base_confidence=0.0, final_confidence=0.0, adjustment=0.0,
+        sufficient_history=sufficient, win_rate=0.6, sample_size=n,
+        explanation="x", conflict_dampened=dampened,
+    )
+
+
+def _render(state, structural, calibrated, cal):
+    from cli.dashboard import render_dashboard
+    cs = state.confidence_state
+    cs.structural_confidence = structural
+    cs.calibrated_confidence = calibrated
+    cs.calibration_result    = cal
+    return render_dashboard(state.market_state, confidence_state=cs)
+
+
+def test_dashboard_without_confidence_state_unchanged():
+    from cli.dashboard import render_dashboard
+    state, _ = _cycled()
+    out = render_dashboard(state.market_state)
+    assert "Final Conviction" not in out
+    assert "Historical Adjustment" not in out
+
+
+def test_dashboard_shows_final_conviction_with_label():
+    state, _ = _cycled()
+    out = _render(state, 69.0, 72.0, _cal())
+    assert "Final Conviction      : 72%  (Moderate-High)" in out
+
+
+def test_dashboard_shows_historical_adjustment():
+    state, _ = _cycled()
+    out = _render(state, 69.0, 72.0, _cal())
+    assert "Historical Adjustment : +3 pts  · structural 69%" in out
+
+
+def test_dashboard_negative_adjustment():
+    state, _ = _cycled()
+    out = _render(state, 69.0, 61.0, _cal())
+    assert "Historical Adjustment : -8 pts  · structural 69%" in out
+
+
+def test_dashboard_insufficient_history_explained():
+    state, _ = _cycled()
+    out = _render(state, 63.0, 63.0, _cal(sufficient=False, n=4))
+    assert "Historical Adjustment : none  · 4 obs, need 10" in out
+
+
+def test_dashboard_no_adjustment_with_history():
+    state, _ = _cycled()
+    out = _render(state, 63.0, 63.2, _cal())
+    assert "Historical Adjustment : none  · structural 63%" in out
+
+
+def test_dashboard_marks_dampened():
+    state, _ = _cycled()
+    out = _render(state, 69.0, 72.0, _cal(dampened=True))
+    assert "· dampened" in out
+
+
+def test_dashboard_regime_confidence_kept_separate():
+    state, _ = _cycled()
+    out = _render(state, 69.0, 72.0, _cal())
+    regime_pct = f"({state.market_state.regime.confidence:.0%})"
+    assert any(l.strip().startswith("Regime") and regime_pct in l for l in out.split("\n"))
+
+
+def test_dashboard_conviction_lines_fit_box():
+    from cli.dashboard import WIDTH
+    state, _ = _cycled()
+    out = _render(state, 50.0, 65.0, _cal(dampened=True))
+    for line in out.split("\n"):
+        if "Conviction" in line or "Historical Adjustment" in line:
+            assert len(line) <= WIDTH, line
+
+
+def test_runtime_loop_passes_confidence_state():
+    import runtime.runtime_loop as rl
+    state, _ = _cycled()
+    with mock.patch.object(rl, "render_dashboard", return_value="") as rd, \
+         mock.patch("builtins.print"):
+        rl._render_dashboard(state)
+    assert rd.call_args.kwargs["confidence_state"] is state.confidence_state
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 
