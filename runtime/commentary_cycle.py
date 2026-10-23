@@ -202,6 +202,8 @@ def generate_commentary(
             return None
 
         text = result.text
+        if trigger == TRIGGER_STARTUP:
+            text = _stamp_briefing(text, state)
         _commit_commentary(state, text, trigger)
 
         # Advance event intelligence state only after successful commentary.
@@ -348,6 +350,25 @@ def _log_structure_debug(state: RuntimeState, trigger: str) -> None:
         )
     except Exception as e:
         logger.debug(f"[structure-debug] Could not log structure details: {e}")
+
+
+def _stamp_briefing(text: str, state: RuntimeState) -> str:
+    """
+    v2.7 — the startup briefing is a session-open snapshot.  Prefix when it
+    was generated and which cycle's confidence it used, so later dashboard
+    values aren't read as contradictions.  Prefixed (not appended) because
+    the runtime loop prints only the first 300 chars of commentary.
+    Never raises: on any failure the text is returned unchanged.
+    """
+    try:
+        from engine.market_session import to_et_string
+        when = to_et_string(datetime.now(tz=timezone.utc))
+        cs   = getattr(state, "confidence_state", None)
+        src  = f" · confidence from cycle {cs.source_cycle}" if cs is not None else ""
+        return f"[Generated {when}{src} — session-open snapshot]\n{text}"
+    except Exception as e:
+        logger.warning(f"[commentary] Briefing timestamp failed (non-fatal): {e}")
+        return text
 
 
 def _commit_commentary(state: RuntimeState, text: str, trigger: str) -> None:

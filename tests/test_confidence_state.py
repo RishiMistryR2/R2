@@ -538,6 +538,68 @@ def test_prompt_section_survives_truncation():
 
 
 # ──────────────────────────────────────────────────────────────
+# Startup briefing "generated at" stamp (step 15)
+# ──────────────────────────────────────────────────────────────
+
+def _briefing(state):
+    import runtime.commentary_cycle as cc
+    state.mock_ai = True
+    return cc.generate_commentary(state, trigger="startup_briefing")
+
+
+def test_briefing_prefixed_with_generated_at():
+    import re
+    state, _ = _cycled()
+    text = _briefing(state)
+    first = text.split("\n", 1)[0]
+    assert re.match(r"\[Generated \d\d:\d\d:\d\d ET", first), first
+    assert "session-open snapshot]" in first
+
+
+def test_briefing_stamp_names_confidence_cycle():
+    from runtime.update_cycle import run_update_cycle
+    state, _ = _cycled()
+    run_update_cycle(state)
+    assert "confidence from cycle 2" in _briefing(state).split("\n", 1)[0]
+
+
+def test_briefing_stamp_without_confidence_state():
+    state, _ = _cycled()
+    state.confidence_state = None
+    first = _briefing(state).split("\n", 1)[0]
+    assert first.startswith("[Generated ")
+    assert "cycle" not in first
+
+
+def test_briefing_stamp_visible_in_dashboard_preview():
+    # runtime_loop prints latest_commentary[:300]; the stamp must be in it.
+    state, _ = _cycled()
+    _briefing(state)
+    assert state.latest_commentary[:300].startswith("[Generated ")
+
+
+def test_market_commentary_not_stamped():
+    import runtime.commentary_cycle as cc
+    from engine.event_engine import EventIntelligenceResult
+    state, _ = _cycled()
+    state.mock_ai = True
+    ok = EventIntelligenceResult(priority="important", score=50.0, changes=[],
+                                 suppress=False, change_summary="",
+                                 trigger="regime_change")
+    with mock.patch("engine.event_engine.evaluate_event", return_value=ok):
+        text = cc.generate_commentary(state, trigger="regime_change")
+    assert not text.startswith("[Generated ")
+
+
+def test_stamp_failure_returns_text_unchanged():
+    import runtime.commentary_cycle as cc
+    state, _ = _cycled()
+    with mock.patch("engine.market_session.to_et_string",
+                    side_effect=RuntimeError("boom")):
+        assert cc._stamp_briefing("body", state) == "body"
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 
