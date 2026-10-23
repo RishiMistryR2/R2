@@ -114,6 +114,11 @@ class RuntimeState:
     # Market Structure Engine v2.0A — set by update_cycle each tick
     structure_state: Any = None  # engine.structure_engine.StructureState
 
+    # v2.7 — single authoritative confidence, computed once per update cycle
+    # by update_cycle._run_confidence_pipeline().  Consumers read this; none
+    # recompute.  None until the first successful pipeline run.
+    confidence_state: Any = None  # engine.confidence_engine.ConfidenceState
+
     # Warnings (refreshed each update cycle)
     active_warnings:      List[Any]      = field(default_factory=list)
     max_warning_severity: Optional[str]  = None
