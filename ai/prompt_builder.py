@@ -251,6 +251,7 @@ def _format_context(package: StatePackage, max_chars: int = _MAX_CONTEXT_CHARS) 
 
     Section order:
       1. MARKET STRUCTURE  — always first, explicitly labelled to lead response
+      1b. THESIS CONFIDENCE — v2.7 stored values; model quotes, never estimates
       2. REGIME & SESSION  — includes actual market_session label
       3. INDICATOR SUPPORT — explicitly labelled secondary
       4. SETUP
@@ -265,6 +266,10 @@ def _format_context(package: StatePackage, max_chars: int = _MAX_CONTEXT_CHARS) 
     struct = d.get("structure")
     if struct:
         parts.append(_fmt_structure(struct))
+
+    conf = d.get("confidence")
+    if conf:
+        parts.append(_fmt_confidence(conf))
 
     market = d.get("market")
     if market:
@@ -355,6 +360,39 @@ def _fmt_structure(s: dict) -> str:
     if swing_parts:
         lines.append(f"\nSwing prices:  {'  |  '.join(swing_parts)}")
 
+    return "\n".join(lines)
+
+
+def _fmt_confidence(conf: dict) -> str:
+    """
+    v2.7 — the cycle's single authoritative confidence.  Placed straight
+    after structure so it survives context truncation.  Tells the model to
+    quote these figures and keeps the distinct concepts apart.
+    """
+    lines = ["=== THESIS CONFIDENCE (authoritative — quote these figures, "
+             "never estimate your own) ==="]
+    try:
+        from engine.confidence_engine import _label_for
+        final      = float(conf.get("calibrated"))
+        structural = float(conf.get("structural", final))
+        label, _   = _label_for(final)
+        adj        = float(conf.get("historical_adjustment", final - structural))
+    except (TypeError, ValueError, ImportError):
+        return ""
+
+    lines.append(f"Final conviction: {final:.0f}% ({label})")
+    adj_str = f"{adj:+.0f}" if abs(adj) >= 0.5 else "none"
+    lines.append(f"Structural thesis: {structural:.0f}%  |  Historical adjustment: {adj_str}")
+
+    cal = conf.get("calibration") or {}
+    if cal.get("explanation"):
+        lines.append(f"History: {cal['explanation']}")
+
+    lines.append(
+        "Regime confidence (in REGIME & SESSION) is the regime classifier's own "
+        "estimate — a separate number, not thesis conviction.  Entry permission "
+        "is an action filter, not evidence about direction."
+    )
     return "\n".join(lines)
 
 

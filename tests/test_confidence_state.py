@@ -477,6 +477,67 @@ def test_runtime_loop_passes_confidence_state():
 
 
 # ──────────────────────────────────────────────────────────────
+# Prompt builder — THESIS CONFIDENCE section (step 14)
+# ──────────────────────────────────────────────────────────────
+
+def _context(state):
+    from ai.prompt_builder import _format_context
+    return _format_context(_built_package(state, "market_commentary"))
+
+
+def test_prompt_has_confidence_section_after_structure():
+    state, _ = _cycled()
+    ctx = _context(state)
+    i_struct = ctx.index("=== MARKET STRUCTURE")
+    i_conf   = ctx.index("=== THESIS CONFIDENCE")
+    i_regime = ctx.index("=== REGIME & SESSION")
+    assert i_struct < i_conf < i_regime
+
+
+def test_prompt_shows_stored_values():
+    state, _ = _cycled()
+    cs = state.confidence_state
+    cs.structural_confidence = 66.0
+    cs.calibrated_confidence = 71.0
+    ctx = _context(state)
+    assert "Final conviction: 71% (Moderate-High)" in ctx
+    assert "Structural thesis: 66%  |  Historical adjustment: +5" in ctx
+
+
+def test_prompt_no_adjustment_shows_none():
+    state, _ = _cycled()
+    assert "Historical adjustment: none" in _context(state)
+
+
+def test_prompt_includes_calibration_explanation():
+    state, _ = _cycled()
+    assert state.confidence_state.calibration_result.explanation in _context(state)
+
+
+def test_prompt_tells_model_not_to_estimate():
+    state, _ = _cycled()
+    ctx = _context(state)
+    assert "never estimate your own" in ctx
+    assert "separate number" in ctx
+
+
+def test_prompt_omits_section_without_confidence():
+    state, _ = _cycled()
+    state.confidence_state = None
+    assert "THESIS CONFIDENCE" not in _context(state)
+
+
+def test_prompt_section_survives_truncation():
+    # A tight budget cuts later sections first; confidence sits near the top.
+    from ai.prompt_builder import _format_context
+    state, _ = _cycled()
+    pkg  = _built_package(state, "market_commentary")
+    full = _format_context(pkg)
+    end  = full.index("=== REGIME & SESSION")
+    assert "Final conviction" in _format_context(pkg, max_chars=end)
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 

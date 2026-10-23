@@ -209,6 +209,19 @@ def test_entry_permission_never_changes_shared_value():
     assert before == after == state.confidence_state.calibrated_confidence
 
 
+def test_real_ai_prompts_carry_the_same_value():
+    from ai import prompt_builder as pb
+    with _pattern():
+        state, _ = _calibrated_state()
+        expected = round(state.confidence_state.calibrated_confidence)
+        prompts = [
+            pb.build_startup_briefing_prompt(_package(state, "startup_briefing")),
+            pb.build_market_commentary_prompt(_package(state, "market_commentary")),
+        ]
+    for _, user in prompts:
+        assert f"Final conviction: {expected}%" in user
+
+
 # ──────────────────────────────────────────────────────────────
 # Fallback stays consistent
 # ──────────────────────────────────────────────────────────────
