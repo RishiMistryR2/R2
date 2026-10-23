@@ -244,12 +244,16 @@ def test_package_market_session_premarket():
 def test_package_market_session_differs_from_phase():
     """market_session should say after_hours even though session.phase says power_hour."""
     from ai.state_packager import package_market_state
+    from engine.models import SessionPhase
     state = _demo_state_with_session("after_hours")
+    # Pin the phase explicitly — build_demo_state derives it from now(), which
+    # made this test fail outside trading hours. The lossy mapping puts
+    # AFTER_HOURS → power_hour in session.phase.
+    state.session.phase = SessionPhase.POWER_HOUR
     pkg   = package_market_state(state)
-    # The lossy mapping puts AFTER_HOURS → power_hour in session.phase
-    # but market_session should be the real value
+    # market_session should be the real value, independent of session.phase
     assert pkg["market_session"] == "after_hours"
-    assert pkg.get("session", {}).get("phase") in ("power_hour", "after_hours", None)
+    assert pkg["session"]["phase"] == "power_hour"
 
 
 def test_package_without_market_session_safe():
