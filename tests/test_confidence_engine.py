@@ -580,6 +580,91 @@ def test_thesis_from_package_without_block_falls_back():
 
 
 # ──────────────────────────────────────────────────────────────
+# Structured evidence (regression features)
+# ──────────────────────────────────────────────────────────────
+
+_KNOWN_EVIDENCE_KEYS = {
+    "direction_present", "sequence_strength", "trend_intact", "trend_weakening",
+    "regime_aligned", "regime_chop_vs_trend", "regime_opposes",
+    "regime_consistent_with_range", "regime_directional_no_sequence",
+    "regime_confidence_high", "regime_confidence_low",
+    "structural_reference_defined", "opposing_level_unbroken",
+    "event_vwap_reclaim", "event_vwap_rejection",
+    "event_failed_breakout", "event_failed_breakdown",
+    "confirmation_pending",
+    "session_midday", "session_power_hour", "session_premarket",
+    "session_after_hours", "session_closed",
+}
+
+
+def _evidence_cases():
+    import itertools
+    events = [[], ["vwap_reclaim", "failed_breakdown"], ["vwap_rejection", "failed_breakout"]]
+    for fields, regime, sess, conf, evs, intact in itertools.product(
+            (_uptrend(), _downtrend(), _range()),
+            ("trend_bull", "trend_bear", "chop", ""),
+            ("open", "midday", "power_hour", "premarket", "after_hours", "closed"),
+            (0.3, 0.6, 0.8), events, (True, False)):
+        f = dict(fields, recent_events=evs, trend_intact=intact)
+        yield f, regime, conf, sess
+
+
+def test_evidence_accounts_for_score():
+    # clamp(35 + sum(points)) must reproduce the score exactly, so the
+    # recorded items are a complete explanation of every score.
+    from engine.confidence_engine import compute_confidence
+    for f, regime, conf, sess in _evidence_cases():
+        cr = compute_confidence(f, regime, conf, sess)
+        rebuilt = round(max(15.0, min(90.0, 35 + sum(e.points for e in cr.evidence))), 1)
+        assert rebuilt == cr.score, (f["direction"], regime, conf, sess, cr.evidence)
+
+
+def test_evidence_polarity_matches_sign():
+    from engine.confidence_engine import compute_confidence
+    for f, regime, conf, sess in _evidence_cases():
+        for e in compute_confidence(f, regime, conf, sess).evidence:
+            assert e.polarity in ("supporting", "contradicting")
+            if e.points > 0:
+                assert e.polarity == "supporting", e
+            if e.points < 0:
+                assert e.polarity == "contradicting", e
+
+
+def test_evidence_keys_known_and_unique():
+    from engine.confidence_engine import compute_confidence
+    seen = set()
+    for f, regime, conf, sess in _evidence_cases():
+        keys = [e.key for e in compute_confidence(f, regime, conf, sess).evidence]
+        assert len(keys) == len(set(keys)), keys
+        assert set(keys) <= _KNOWN_EVIDENCE_KEYS, set(keys) - _KNOWN_EVIDENCE_KEYS
+        seen |= set(keys)
+    assert seen == _KNOWN_EVIDENCE_KEYS, _KNOWN_EVIDENCE_KEYS - seen
+
+
+def test_text_only_evidence_has_zero_points():
+    from engine.confidence_engine import compute_confidence
+    cr = compute_confidence(_uptrend(), "trend_bull", 0.6, "open")
+    by_key = {e.key: e for e in cr.evidence}
+    assert by_key["opposing_level_unbroken"].points == 0
+    assert by_key["opposing_level_unbroken"].polarity == "contradicting"
+    assert by_key["confirmation_pending"].points == 0
+
+
+def test_evidence_independent_of_entries_allowed():
+    from engine.confidence_engine import compute_confidence
+    a = compute_confidence(_uptrend(), "trend_bull", 0.8, "after_hours", True)
+    b = compute_confidence(_uptrend(), "trend_bull", 0.8, "after_hours", False)
+    assert a.evidence == b.evidence
+
+
+def test_evidence_item_to_dict():
+    from engine.confidence_engine import EvidenceItem
+    assert EvidenceItem("trend_intact", 10, "supporting").to_dict() == {
+        "key": "trend_intact", "points": 10, "polarity": "supporting",
+    }
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 

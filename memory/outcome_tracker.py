@@ -90,6 +90,12 @@ logger = logging.getLogger("memory.outcome")
 _DEFAULT_PATH     = os.path.expanduser("~/.r2/outcome_tracker.json")
 _MAX_OBSERVATIONS = 500
 _DEFAULT_TIMEOUT       = 120.0   # minutes
+
+# Written to every new PatternObservation.  Bump when the meaning of a
+# stored field changes.  1 is implied for records with no schema_version.
+#   2 — v2.7: confidence_score is structural (no entries penalty);
+#       structured evidence recorded
+OBSERVATION_SCHEMA_VERSION = 2
 _MIN_ELAPSED_MINUTES   = 0.001   # 60 ms floor — ensures tiny timeout sentinels
                                   # (e.g. 0.0001 min) resolve deterministically
                                   # in tests without wall-clock sleeps
@@ -285,6 +291,18 @@ class PatternObservation:
     # ── v2.7: Final Conviction at record time (audit/display only) ──
     calibrated_confidence: Optional[float] = None
 
+    # ── Record format ─────────────────────────────────────────
+    # None = written before schema versioning (pre-v2.7: confidence_score
+    # may include the removed −5 entries penalty).  2 = structural
+    # confidence without the penalty, plus structured evidence.
+    schema_version: Optional[int] = None
+
+    # Structured evidence behind confidence_score, one dict per item:
+    #   {"key": str, "points": float, "polarity": "supporting"|"contradicting"}
+    # None = not recorded (old record, or confidence pipeline unavailable
+    # that cycle).  [] = recorded, no evidence items applied.
+    evidence: Optional[list] = None
+
     @property
     def elapsed_minutes(self) -> float:
         try:
@@ -403,6 +421,7 @@ class OutcomeTracker:
         symbol:    str = "SPY",
         structural_confidence: Optional[float] = None,
         calibrated_confidence: Optional[float] = None,
+        evidence:              Optional[list]  = None,
     ) -> str:
         """
         Record a new structural observation.
@@ -417,6 +436,10 @@ class OutcomeTracker:
         carries the calibrated Final Conviction).  Recording the calibrated
         value would feed past calibration back into future calibration.
         calibrated_confidence is stored alongside for audit.
+
+        evidence: the structured items behind structural_confidence
+        (EvidenceItem objects or dicts with key/points/polarity).  Stored
+        as plain dicts.  None means "not recorded".
 
         Returns the new observation ID.
         """
@@ -465,6 +488,8 @@ class OutcomeTracker:
             calibrated_confidence = (float(calibrated_confidence)
                                      if calibrated_confidence is not None
                                      else None),
+            schema_version   = OBSERVATION_SCHEMA_VERSION,
+            evidence         = _evidence_dicts(evidence),
         )
 
         self._obs[obs.obs_id] = obs
@@ -764,6 +789,22 @@ def _compute_stats(
         avg_mae_atr            = _avg(maes),
         avg_confidence         = _avg(confidences),
     )
+
+
+def _evidence_dicts(evidence) -> Optional[list]:
+    """Normalise EvidenceItem objects / dicts to plain JSON-safe dicts."""
+    if evidence is None:
+        return None
+    out = []
+    for e in evidence:
+        if isinstance(e, dict):
+            key, pts, pol = e.get("key"), e.get("points"), e.get("polarity")
+        else:
+            key = getattr(e, "key", None)
+            pts = getattr(e, "points", None)
+            pol = getattr(e, "polarity", None)
+        out.append({"key": str(key), "points": float(pts or 0.0), "polarity": str(pol)})
+    return out
 
 
 def _dict_to_obs(d: dict) -> PatternObservation:

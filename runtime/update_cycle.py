@@ -281,6 +281,7 @@ def _compute_confidence_state(state: RuntimeState):
         calibration_result    = calibration,
         computed_at           = datetime.now(tz=timezone.utc),
         source_cycle          = state.update_count,
+        evidence              = list(cr.evidence),
     )
 
 # ──────────────────────────────────────────────

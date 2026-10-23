@@ -42,8 +42,15 @@ answer them.
 
 ### 1. Are the hand-coded confidence weights predictive?
 
-For every resolved observation, you have `confidence_score` (structural) and
-`outcome`. Bucket by confidence and compute the directional hit rate per bucket.
+For every resolved observation, you have `confidence_score` and `outcome`.
+Bucket by confidence and compute the directional hit rate per bucket.
+
+**Use only records with `schema_version == 2`.** Records without a
+`schema_version` were written before v2.7: their `confidence_score` can
+include the removed −5 "entries not permitted" penalty, so they sit on a
+different scale and would distort the buckets (worst after hours, when
+entries were always disabled). From schema 2 on, `confidence_score` is the
+structural score with no entries penalty.
 
 - If 70–80% confidence observations resolve in the predicted direction ~75%
   of the time, and 40–50% ones resolve ~45%, the weights are calibrated.
@@ -57,10 +64,29 @@ For every resolved observation, you have `confidence_score` (structural) and
 
 ### 2. Which evidence items actually matter?
 
-Fit a logistic regression: outcome ~ structure_direction + regime_aligned +
-session + trend_intact + has_vwap_reclaim + ... (one feature per evidence
-item in `compute_confidence`). Compare the fitted coefficients to the
+Each schema-2 observation stores an `evidence` list — one entry per evidence
+item `compute_confidence` applied:
+
+```json
+{"key": "regime_aligned", "points": 12.0, "polarity": "supporting"}
+```
+
+Keys are stable snake_case names (`trend_intact`, `regime_opposes`,
+`event_vwap_reclaim`, `session_after_hours`, …; the full set is listed in
+`tests/test_confidence_engine.py::_KNOWN_EVIDENCE_KEYS`). The items fully
+account for the score: `clamp(35 + sum(points), 15, 90) == confidence_score`.
+Text-only items (`opposing_level_unbroken`, `confirmation_pending`) are
+recorded with 0 points so their presence can still be tested.
+
+Fit a logistic regression: outcome ~ one indicator column per evidence key
+(plus `direction`, `market_state`, `regime_name` and `session`, which are
+stored as their own fields). Compare the fitted coefficients to the
 hand-coded point values.
+
+Use only records where `evidence` is not `None`. It is `None` for records
+written before evidence was recorded, and for cycles where the confidence
+pipeline failed. An empty list means the record was taken but no evidence
+item applied.
 
 - Coefficients that match the hand-coded signs and rough magnitudes
   confirm the intuition.
@@ -136,15 +162,23 @@ product.
 ## What is already in place to support this
 
 - `memory/outcome_tracker.py` — records every significant event with
-  features and resolves outcomes. This is the training dataset.
+  features and resolves outcomes. This is the training dataset. Each record
+  carries `schema_version` and structured `evidence` (see question 2).
 - `memory/statistical_intelligence.py` — already computes per-pattern,
   per-bucket, and per-direction statistics. Extend this before building
   anything new.
 - `ConfidenceState.calibration_result` — carries sample size, raw and
   applied adjustment, and conflict dampening. Every calibration is already
   logged with its reasoning.
-- The 30-day staleness filter means the dataset self-prunes to recent
-  regime conditions.
+- **The dataset is capped, not age-pruned.** The tracker keeps at most 500
+  observations (`_MAX_OBSERVATIONS` in `memory/outcome_tracker.py`); past
+  that it permanently deletes the oldest
+  resolved ones first. So `~/.r2/outcome_tracker.json` always holds the most
+  recent ≤500 records, whatever their age. To analyse more history than
+  that, copy the file somewhere before older records are evicted.
+- The 30-day staleness filter in `statistical_intelligence` only limits what
+  *calibration* reads. It does not delete anything from the tracker, and it
+  does not apply to an offline analysis of the JSON.
 
 ## What to build when the time comes (sketch, not a plan)
 

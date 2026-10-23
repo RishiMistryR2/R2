@@ -1130,6 +1130,81 @@ def test_pre_v27_json_loads_without_calibrated_field():
         os.unlink(path)
 
 
+# ══════════════════════════════════════════════════════════════
+# Schema version + structured evidence
+# ══════════════════════════════════════════════════════════════
+
+def test_new_record_has_schema_version_2():
+    from memory.outcome_tracker import OutcomeTracker, OBSERVATION_SCHEMA_VERSION
+    t   = OutcomeTracker(path=":memory:")
+    obs = t.get_observation(t.record_observation(_snap(), [_pat("X")]))
+    assert OBSERVATION_SCHEMA_VERSION == 2
+    assert obs.schema_version == 2
+
+
+def test_evidence_items_stored_as_dicts():
+    from engine.confidence_engine import EvidenceItem
+    from memory.outcome_tracker import OutcomeTracker
+    t   = OutcomeTracker(path=":memory:")
+    ev  = [EvidenceItem("trend_intact", 10, "supporting"),
+           {"key": "session_closed", "points": -18, "polarity": "contradicting"}]
+    obs = t.get_observation(t.record_observation(_snap(), [_pat("X")], evidence=ev))
+    assert obs.evidence == [
+        {"key": "trend_intact",   "points": 10.0,  "polarity": "supporting"},
+        {"key": "session_closed", "points": -18.0, "polarity": "contradicting"},
+    ]
+
+
+def test_evidence_none_when_not_given_and_empty_list_kept():
+    from memory.outcome_tracker import OutcomeTracker
+    t = OutcomeTracker(path=":memory:")
+    none_obs  = t.get_observation(t.record_observation(_snap(), [_pat("X")]))
+    empty_obs = t.get_observation(t.record_observation(_snap(), [_pat("X")], evidence=[]))
+    assert none_obs.evidence is None
+    assert empty_obs.evidence == []
+
+
+def test_evidence_and_schema_survive_save_load():
+    from memory.outcome_tracker import OutcomeTracker
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+        path = fh.name
+    try:
+        t1  = OutcomeTracker(path=path)
+        ev  = [{"key": "regime_aligned", "points": 12, "polarity": "supporting"}]
+        oid = t1.record_observation(_snap(), [_pat("X")], evidence=ev)
+        t1.save()
+        obs = OutcomeTracker(path=path).get_observation(oid)
+        assert obs.schema_version == 2
+        assert obs.evidence == [{"key": "regime_aligned", "points": 12.0,
+                                 "polarity": "supporting"}]
+    finally:
+        os.unlink(path)
+
+
+def test_pre_schema_json_loads_with_none_fields():
+    # A record written before schema versioning has none of the new fields.
+    import json
+    from memory.outcome_tracker import OutcomeTracker
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+        path = fh.name
+    try:
+        t1  = OutcomeTracker(path=path)
+        oid = t1.record_observation(_snap(), [_pat("X")], evidence=[])
+        t1.save()
+        with open(path) as fh:
+            data = json.load(fh)
+        for k in ("schema_version", "evidence", "calibrated_confidence"):
+            del data["observations"][oid][k]
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+        obs = OutcomeTracker(path=path).get_observation(oid)
+        assert obs is not None
+        assert obs.schema_version        is None
+        assert obs.evidence              is None
+        assert obs.calibrated_confidence is None
+    finally:
+        os.unlink(path)
+
 # ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────

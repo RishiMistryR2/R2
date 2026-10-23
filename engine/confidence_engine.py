@@ -54,6 +54,26 @@ class ConfidenceState:
     calibration_result: Optional["CalibrationResult"]
     computed_at: datetime
     source_cycle: int
+    evidence: list = field(default_factory=list)   # list[EvidenceItem] behind structural
+
+
+@dataclass(frozen=True)
+class EvidenceItem:
+    """
+    One structured evidence item from compute_confidence().
+
+    key      — stable snake_case identifier (a regression feature name)
+    points   — score contribution (0 for text-only items)
+    polarity — "supporting" | "contradicting"
+
+    Invariant: clamp(35 + sum(points), 15, 90) == ConfidenceResult.score.
+    """
+    key:      str
+    points:   float
+    polarity: str
+
+    def to_dict(self) -> dict:
+        return {"key": self.key, "points": self.points, "polarity": self.polarity}
 
 
 @dataclass
@@ -63,6 +83,7 @@ class ConfidenceResult:
     supporting:    list = field(default_factory=list)
     contradicting: list = field(default_factory=list)
     conviction:    str  = "Moderate"
+    evidence:      list = field(default_factory=list)   # list[EvidenceItem]
 
     def __str__(self) -> str:
         return f"Confidence: {self.score:.0f}% ({self.label}) — Conviction: {self.conviction}"
@@ -88,6 +109,7 @@ def compute_confidence(
     """
     supporting:    list[str] = []
     contradicting: list[str] = []
+    evidence:      list[EvidenceItem] = []
     score: float = 35.0
 
     # ── Extract fields ─────────────────────────────────────────
@@ -114,6 +136,7 @@ def compute_confidence(
     # ── 1. Direction presence ──────────────────────────────────
     if direction in ("uptrend", "downtrend"):
         score += 10
+        evidence.append(EvidenceItem("direction_present", 10, "supporting"))
 
     # ── 2. Sequence strength ───────────────────────────────────
     if seq:
@@ -121,6 +144,8 @@ def compute_confidence(
         pairs  = len(tokens) // 2
         boost  = min(pairs * 3, 15)
         score += boost
+        if boost or direction in ("uptrend", "downtrend"):
+            evidence.append(EvidenceItem("sequence_strength", boost, "supporting"))
 
         if direction == "uptrend":
             supporting.append(
@@ -136,8 +161,10 @@ def compute_confidence(
         if intact:
             score += 10
             supporting.append("Trend sequence is unbroken — no structural violation detected.")
+            evidence.append(EvidenceItem("trend_intact", 10, "supporting"))
         else:
             score -= 10
+            evidence.append(EvidenceItem("trend_weakening", -10, "contradicting"))
             contradicting.append(
                 "Trend sequence is weakening — structure may be breaking down."
             )
@@ -150,17 +177,20 @@ def compute_confidence(
                 f"Regime confirms upside bias ({regime_name.replace('_', ' ')}, "
                 f"{regime_conf:.0%} confidence)."
             )
+            evidence.append(EvidenceItem("regime_aligned", 12, "supporting"))
         elif is_chop_reg:
             score -= 15
             contradicting.append(
                 "Regime classified as Chop — directional edge is uncertain."
             )
+            evidence.append(EvidenceItem("regime_chop_vs_trend", -15, "contradicting"))
         elif is_bear_reg:
             score -= 18
             contradicting.append(
                 f"Regime contradicts structure — "
                 f"{regime_name.replace('_', ' ')} disagrees with the uptrend reading."
             )
+            evidence.append(EvidenceItem("regime_opposes", -18, "contradicting"))
 
     elif direction == "downtrend":
         if is_bear_reg:
@@ -169,25 +199,30 @@ def compute_confidence(
                 f"Regime confirms downside bias ({regime_name.replace('_', ' ')}, "
                 f"{regime_conf:.0%} confidence)."
             )
+            evidence.append(EvidenceItem("regime_aligned", 12, "supporting"))
         elif is_chop_reg:
             score -= 15
             contradicting.append(
                 "Regime classified as Chop — directional edge is uncertain."
             )
+            evidence.append(EvidenceItem("regime_chop_vs_trend", -15, "contradicting"))
         elif is_bull_reg:
             score -= 18
             contradicting.append(
                 f"Regime contradicts structure — "
                 f"{regime_name.replace('_', ' ')} disagrees with the downtrend reading."
             )
+            evidence.append(EvidenceItem("regime_opposes", -18, "contradicting"))
 
     else:
         # Range / no direction
         if is_chop_reg:
             score += 5
             supporting.append("Regime is consistent with range-bound structure.")
+            evidence.append(EvidenceItem("regime_consistent_with_range", 5, "supporting"))
         elif is_bull_reg or is_bear_reg:
             score -= 5
+            evidence.append(EvidenceItem("regime_directional_no_sequence", -5, "contradicting"))
             contradicting.append(
                 f"Regime ({regime_name.replace('_', ' ')}) suggests direction "
                 "but no clear structural sequence has formed."
@@ -196,8 +231,10 @@ def compute_confidence(
     # ── 5. Regime confidence quality ──────────────────────────
     if regime_conf >= 0.75:
         score += 5
+        evidence.append(EvidenceItem("regime_confidence_high", 5, "supporting"))
     elif regime_conf < 0.45:
         score -= 5
+        evidence.append(EvidenceItem("regime_confidence_low", -5, "contradicting"))
         contradicting.append(
             f"Regime confidence is low ({regime_conf:.0%}) — edge may be unreliable."
         )
@@ -205,11 +242,13 @@ def compute_confidence(
     # ── 6. Defined stop / reference level ─────────────────────
     if direction == "uptrend" and hl:
         score += 5
+        evidence.append(EvidenceItem("structural_reference_defined", 5, "supporting"))
         supporting.append(
             f"Higher low at {hl:.2f} provides a defined structural stop reference."
         )
     elif direction == "downtrend" and lh:
         score += 5
+        evidence.append(EvidenceItem("structural_reference_defined", 5, "supporting"))
         supporting.append(
             f"Lower high at {lh:.2f} provides a defined structural resistance reference."
         )
@@ -219,10 +258,12 @@ def compute_confidence(
         contradicting.append(
             f"Seller resistance at session high ({s_high:.2f}) remains unbroken."
         )
+        evidence.append(EvidenceItem("opposing_level_unbroken", 0, "contradicting"))
     elif direction == "downtrend" and s_low:
         contradicting.append(
             f"Buyer support at session low ({s_low:.2f}) has not yet been taken."
         )
+        evidence.append(EvidenceItem("opposing_level_unbroken", 0, "contradicting"))
 
     # ── 8. Behavioral events ───────────────────────────────────
     if direction == "uptrend":
@@ -230,11 +271,13 @@ def compute_confidence(
             if "vwap_reclaim" in ev:
                 score += 5
                 supporting.append("VWAP reclaim confirmed — buyers regained equilibrium.")
+                evidence.append(EvidenceItem("event_vwap_reclaim", 5, "supporting"))
                 break
         for ev in ev_strs:
             if "failed_breakdown" in ev:
                 score += 5
                 supporting.append("Failed breakdown — sellers lost control of support.")
+                evidence.append(EvidenceItem("event_failed_breakdown", 5, "supporting"))
                 break
         for ev in ev_strs:
             if "vwap_rejection" in ev:
@@ -242,6 +285,7 @@ def compute_confidence(
                 contradicting.append(
                     "Recent VWAP rejection — buyers struggling at the equilibrium level."
                 )
+                evidence.append(EvidenceItem("event_vwap_rejection", -5, "contradicting"))
                 break
 
     elif direction == "downtrend":
@@ -249,11 +293,13 @@ def compute_confidence(
             if "vwap_rejection" in ev:
                 score += 5
                 supporting.append("VWAP rejection confirmed — sellers defending equilibrium.")
+                evidence.append(EvidenceItem("event_vwap_rejection", 5, "supporting"))
                 break
         for ev in ev_strs:
             if "failed_breakout" in ev:
                 score += 5
                 supporting.append("Failed breakout — buyers lost control of resistance.")
+                evidence.append(EvidenceItem("event_failed_breakout", 5, "supporting"))
                 break
         for ev in ev_strs:
             if "vwap_reclaim" in ev:
@@ -261,11 +307,13 @@ def compute_confidence(
                 contradicting.append(
                     "Recent VWAP reclaim by buyers — bearish edge is softening."
                 )
+                evidence.append(EvidenceItem("event_vwap_reclaim", -5, "contradicting"))
                 break
 
     # ── 9. Pending confirmation ────────────────────────────────
     if missing:
         contradicting.append(f"Confirmation still pending: {missing.rstrip('.')}.")
+        evidence.append(EvidenceItem("confirmation_pending", 0, "contradicting"))
 
     # ── 10. Session quality ────────────────────────────────────
     _SESSION_ADJ: dict[str, tuple] = {
@@ -280,6 +328,8 @@ def compute_confidence(
     score += adj
     if sess_note:
         contradicting.append(sess_note)
+    if adj or sess_note:
+        evidence.append(EvidenceItem(f"session_{session_key}", adj, "contradicting"))
 
     # ── 11. Entries permitted ──────────────────────────────────
     # Entry readiness is an action filter, not evidence about directional
@@ -306,6 +356,7 @@ def compute_confidence(
         supporting=supporting,
         contradicting=contradicting,
         conviction=conviction,
+        evidence=evidence,
     )
 
 

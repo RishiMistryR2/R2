@@ -600,6 +600,53 @@ def test_stamp_failure_returns_text_unchanged():
 
 
 # ──────────────────────────────────────────────────────────────
+# Structured evidence through the pipeline into history
+# ──────────────────────────────────────────────────────────────
+
+def test_pipeline_stores_evidence_behind_structural():
+    from engine.confidence_engine import compute_confidence
+    state, _ = _cycled()
+    fields, reg_name, reg_conf, sess = _inputs(state)
+    cs = state.confidence_state
+    assert cs.evidence == compute_confidence(fields, reg_name, reg_conf, sess).evidence
+    assert round(max(15, min(90, 35 + sum(e.points for e in cs.evidence))), 1) \
+        == cs.structural_confidence
+
+
+def _record_via_commentary(state):
+    import runtime.commentary_cycle as cc
+    from engine.event_engine import EventIntelligenceResult
+    ok = EventIntelligenceResult(priority="important", score=50.0, changes=[],
+                                 suppress=False, change_summary="",
+                                 trigger="regime_change")
+    state.mock_ai = True
+    with mock.patch("engine.event_engine.evaluate_event", return_value=ok), \
+         mock.patch("engine.pattern_engine.classify_patterns",
+                    return_value=[_Pat("Test Pattern", "bullish")]), \
+         mock.patch("engine.pattern_engine.build_pattern_narrative_from_package",
+                    return_value=""):
+        cc.generate_commentary(state, trigger="regime_change")
+
+
+def test_commentary_records_evidence_and_schema():
+    state, tracker = _cycled()
+    _record_via_commentary(state)
+    (obs,) = tracker.recent_observations(n=5)
+    assert obs.schema_version == 2
+    assert obs.evidence == [e.to_dict() for e in state.confidence_state.evidence]
+    assert all(set(d) == {"key", "points", "polarity"} for d in obs.evidence)
+
+
+def test_commentary_records_none_evidence_without_confidence_state():
+    state, tracker = _cycled()
+    state.confidence_state = None
+    _record_via_commentary(state)
+    (obs,) = tracker.recent_observations(n=5)
+    assert obs.schema_version == 2
+    assert obs.evidence is None
+
+
+# ──────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────
 

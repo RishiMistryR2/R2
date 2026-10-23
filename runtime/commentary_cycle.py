@@ -244,6 +244,8 @@ def generate_commentary(
                             _conf, "structural_confidence", None),
                         calibrated_confidence=getattr(
                             _conf, "calibrated_confidence", None),
+                        evidence=(getattr(_conf, "evidence", None)
+                                  if _conf is not None else None),
                     )
         except Exception as _ot_err:
             logger.debug(
